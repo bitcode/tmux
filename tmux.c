@@ -200,9 +200,11 @@ make_label(const char *label, char **cause)
 	const char *localappdata = getenv("LOCALAPPDATA");
 	if (localappdata == NULL)
 		localappdata = "C:\\Users\\Default\\AppData\\Local";
-	path = xstrdup(localappdata);
-	xasprintf(&base, "%s\\tmux\\tmux-%ld", path, (long)uid);
+	/* ensure parent %LOCALAPPDATA%\tmux exists before creating tmux-<uid> */
+	xasprintf(&path, "%s\\tmux", localappdata);
+	mkdir(path, S_IRWXU);
 	free(path);
+	xasprintf(&base, "%s\\tmux\\tmux-%ld", localappdata, (long)uid);
 #else
 	expand_paths(TMUX_SOCK, &paths, &n, 0);
 	if (n == 0) {

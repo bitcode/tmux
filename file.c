@@ -677,15 +677,24 @@ file_write_open(struct client_files *files, struct tmuxpeer *peer,
 			errno = EBADF;
 		else {
 #ifdef PLATFORM_WINDOWS
-			/* Windows: use _dup() for MSVCRT, with GetStdHandle fallback */
-			cf->fd = _dup(msg->fd);
-			if (cf->fd == -1) {
-				/* Fallback: get Windows handle and create fd */
-				DWORD std_handle = (msg->fd == STDOUT_FILENO) 
+			/*
+			 * Windows: _dup() asserts if the fd is not open in the
+			 * MSVCRT table (e.g. in the detached server process which
+			 * has no console). Validate via _get_osfhandle first, then
+			 * fall back to GetStdHandle + _open_osfhandle.
+			 */
+			{
+				DWORD std_handle_id = (msg->fd == STDOUT_FILENO)
 					? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE;
-				HANDLE h = GetStdHandle(std_handle);
-				if (h != INVALID_HANDLE_VALUE && h != NULL) {
-					cf->fd = _open_osfhandle((intptr_t)h, _O_TEXT);
+				intptr_t oh = _get_osfhandle(msg->fd);
+				if (oh != -1 && (HANDLE)oh != INVALID_HANDLE_VALUE) {
+					cf->fd = _dup(msg->fd);
+				} else {
+					HANDLE h = GetStdHandle(std_handle_id);
+					if (h != INVALID_HANDLE_VALUE && h != NULL)
+						cf->fd = _open_osfhandle((intptr_t)h, _O_TEXT);
+					else
+						cf->fd = -1;
 				}
 			}
 			win32_log("file_write_open: Windows dup result cf->fd=%d errno=%d\n",
@@ -777,8 +786,16 @@ file_write_data(struct client_files *files, struct imsg *imsg)
 				win32_log("file_write_data: first bytes: %s\n", hexbuf);
 			}
 			
+			/* Capture raw VT data to file for debugging */
+			{
+				static FILE *cap = NULL;
+				if (cap == NULL) cap = fopen("tty_capture.bin", "wb");
+				if (cap) { fwrite(msg + 1, 1, size, cap); fflush(cap); }
+			}
 			if (!WriteFile(hConsole, msg + 1, (DWORD)size, &written, NULL)) {
 				win32_log("file_write_data: WriteFile failed, error=%lu\n", GetLastError());
+			} else {
+				win32_log("file_write_data: WriteFile ok, requested=%zu written=%lu\n", size, written);
 			}
 		} else {
 			/* Fallback to win32_write if console handle unavailable */
