@@ -112,7 +112,7 @@ static void	 cmd_parse_print_commands(struct cmd_parse_input *,
 	struct cmd_parse_command		 *command;
 }
 
-%token ERROR
+%token T_ERROR
 %token HIDDEN
 %token IF
 %token ELSE

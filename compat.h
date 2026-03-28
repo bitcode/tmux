@@ -3,7 +3,7 @@
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
+ * copyright notice appear in all copies.
  *
  * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
  * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
@@ -21,11 +21,13 @@
 #include <sys/ioctl.h>
 #include <sys/uio.h>
 
+#ifndef PLATFORM_WINDOWS
 #include <fnmatch.h>
 #include <limits.h>
 #include <stdio.h>
 #include <termios.h>
 #include <wchar.h>
+#endif
 
 #ifdef HAVE_EVENT2_EVENT_H
 #include <event2/event.h>
@@ -36,6 +38,8 @@
 #include <event2/bufferevent.h>
 #include <event2/bufferevent_struct.h>
 #include <event2/bufferevent_compat.h>
+#elif defined(PLATFORM_WINDOWS)
+#include "win32.h"
 #else
 #include <event.h>
 #ifndef EVBUFFER_EOL_LF

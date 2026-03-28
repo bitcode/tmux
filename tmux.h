@@ -90,8 +90,13 @@ struct winlink;
 #define TMUX_SOCK_PERM (7 /* o+rwx */)
 #endif
 #ifndef TMUX_TERM
+#ifdef PLATFORM_WINDOWS
+#define TMUX_TERM "xterm-256color"
+#else
 #define TMUX_TERM "screen"
 #endif
+#endif
+
 #ifndef TMUX_LOCK_CMD
 #define TMUX_LOCK_CMD "lock -np"
 #endif
@@ -1968,6 +1973,12 @@ struct client {
 	u_int			 term_ncaps;
 
 	char			*ttyname;
+#ifdef PLATFORM_WINDOWS
+	u_int			 term_sx;
+	u_int			 term_sy;
+	u_int			 term_xpixel;
+	u_int			 term_ypixel;
+#endif
 	struct tty		 tty;
 
 	size_t			 written;
@@ -2855,7 +2866,11 @@ int	 file_can_print(struct client *);
 void printflike(2, 3) file_print(struct client *, const char *, ...);
 void printflike(2, 0) file_vprint(struct client *, const char *, va_list);
 void	 file_print_buffer(struct client *, void *, size_t);
+#ifdef PLATFORM_WINDOWS
+void	 win32_tty_write(struct client *, void *, size_t);
+#endif
 void printflike(2, 3) file_error(struct client *, const char *, ...);
+
 void	 file_write(struct client *, const char *, int, const void *, size_t,
 	     client_file_cb, void *);
 struct client_file *file_read(struct client *, const char *, client_file_cb,
@@ -2890,6 +2905,7 @@ int	 server_start(struct tmuxproc *, uint64_t, struct event_base *, int,
 	     char *);
 void	 server_update_socket(void);
 void	 server_add_accept(int);
+void server_child_main(struct tmuxproc *, uint64_t, struct event_base *, int, char *);
 void printflike(1, 2) server_add_message(const char *, ...);
 int	 server_create_socket(uint64_t, char **);
 

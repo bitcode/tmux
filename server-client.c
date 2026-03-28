@@ -283,7 +283,13 @@ server_client_create(int fd)
 
 	c = xcalloc(1, sizeof *c);
 	c->references = 1;
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_client_create: calling proc_add_peer for fd=%d\n", fd);
+#endif
 	c->peer = proc_add_peer(server_proc, fd, server_client_dispatch, c);
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_client_create: proc_add_peer returned %p\n", c->peer);
+#endif
 
 	if (gettimeofday(&c->creation_time, NULL) != 0)
 		fatal("gettimeofday failed");
@@ -324,6 +330,10 @@ server_client_open(struct client *c, char **cause)
 {
 	const char	*ttynam = _PATH_TTY;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_client_open: client %p, ttyname=%s\n", c, c->ttyname);
+#endif
+
 	if (c->flags & CLIENT_CONTROL)
 		return (0);
 
@@ -346,9 +356,16 @@ server_client_open(struct client *c, char **cause)
 		return (-1);
 	}
 
-	if (tty_open(&c->tty, cause) != 0)
+	if (tty_open(&c->tty, cause) != 0) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("server_client_open: tty_open failed: %s\n", *cause);
+#endif
 		return (-1);
+	}
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_client_open: success, returning 0\n");
+#endif
 	return (0);
 }
 
@@ -391,6 +408,10 @@ server_client_set_session(struct client *c, struct session *s)
 {
 	struct session	*old = c->session;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_client_set_session: client %p, session %p (old %p)\n", c, s, old);
+#endif
+
 	if (s != NULL && c->session != NULL && c->session != s)
 		c->last_session = c->session;
 	else if (s == NULL)
@@ -401,7 +422,13 @@ server_client_set_session(struct client *c, struct session *s)
 	if (old != NULL && old->curw != NULL)
 		window_update_focus(old->curw->window);
 	if (s != NULL) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("server_client_set_session: recalculating sizes\n");
+#endif
 		recalculate_sizes();
+#ifdef PLATFORM_WINDOWS
+        win32_log("server_client_set_session: updating focus for session %p\n", s);
+#endif
 		window_update_focus(s->curw->window);
 		session_update_activity(s, NULL);
 		session_theme_changed(s);
@@ -411,10 +438,16 @@ server_client_set_session(struct client *c, struct session *s)
 		alerts_check_session(s);
 		tty_update_client_offset(c);
 		status_timer_start(c);
+#ifdef PLATFORM_WINDOWS
+        win32_log("server_client_set_session: notifying client-session-changed\n");
+#endif
 		notify_client("client-session-changed", c);
 		server_redraw_client(c);
 	}
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_client_set_session: checking unattached and updating socket\n");
+#endif
 	server_check_unattached();
 	server_update_socket();
 }
@@ -426,6 +459,9 @@ server_client_lost(struct client *c)
 	struct client_file	*cf, *cf1;
 	struct client_window	*cw, *cw1;
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("server_client_lost: client %p, flags=%X\n", c, c->flags);
+#endif
 	c->flags |= CLIENT_DEAD;
 
 	server_client_clear_overlay(c);
@@ -2670,26 +2706,66 @@ server_client_loop(void)
 	struct window		*w;
 	struct window_pane	*wp;
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("server_client_loop: ENTRY\n");
+#endif
+
 	/* Check for window resize. This is done before redrawing. */
 	RB_FOREACH(w, windows, &windows)
 		server_client_check_window_resize(w);
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("server_client_loop: window resize checks done\n");
+#endif
+
 	/* Check clients. */
 	TAILQ_FOREACH(c, &clients, entry) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("server_client_loop: checking client %p, session=%p\n", 
+			(void*)c, (void*)(c ? c->session : NULL));
+#endif
 		server_client_check_exit(c);
+#ifdef PLATFORM_WINDOWS
+		win32_log("server_client_loop: check_exit done\n");
+#endif
 		if (c->session != NULL) {
+#ifdef PLATFORM_WINDOWS
+			win32_log("server_client_loop: calling check_modes\n");
+#endif
 			server_client_check_modes(c);
+#ifdef PLATFORM_WINDOWS
+			win32_log("server_client_loop: calling check_redraw\n");
+#endif
 			server_client_check_redraw(c);
+#ifdef PLATFORM_WINDOWS
+			win32_log("server_client_loop: calling reset_state\n");
+#endif
 			server_client_reset_state(c);
+#ifdef PLATFORM_WINDOWS
+			win32_log("server_client_loop: reset_state done\n");
+#endif
 		}
 	}
+
+
+#ifdef PLATFORM_WINDOWS
+	win32_log("server_client_loop: client checks done\n");
+#endif
+
 
 	/*
 	 * Any windows will have been redrawn as part of clients, so clear
 	 * their flags now.
 	 */
+#ifdef PLATFORM_WINDOWS
+	win32_log("server_client_loop: starting windows pane loop\n");
+#endif
 	RB_FOREACH(w, windows, &windows) {
 		TAILQ_FOREACH(wp, &w->panes, entry) {
+#ifdef PLATFORM_WINDOWS
+			win32_log("server_client_loop: pane %p fd=%d event=%p\n",
+				(void*)wp, wp->fd, (void*)wp->event);
+#endif
 			if (wp->fd != -1) {
 				server_client_check_pane_resize(wp);
 				server_client_check_pane_buffer(wp);
@@ -2699,12 +2775,19 @@ server_client_loop(void)
 		check_window_name(w);
 	}
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("server_client_loop: starting theme updates\n");
+#endif
 	/* Send theme updates. */
 	RB_FOREACH(w, windows, &windows) {
 		TAILQ_FOREACH(wp, &w->panes, entry)
 			window_pane_send_theme_update(wp);
 	}
+#ifdef PLATFORM_WINDOWS
+	win32_log("server_client_loop: EXIT\n");
+#endif
 }
+
 
 /* Check if window needs to be resized. */
 static void
@@ -3131,7 +3214,7 @@ server_client_check_redraw(struct client *c)
 {
 	struct session		*s = c->session;
 	struct tty		*tty = &c->tty;
-	struct window		*w = c->session->curw->window;
+	struct window		*w;
 	struct window_pane	*wp;
 	int			 needed, tty_flags, mode = tty->mode;
 	uint64_t		 client_flags = 0;
@@ -3141,8 +3224,27 @@ server_client_check_redraw(struct client *c)
 	static struct event	 ev;
 	size_t			 left;
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("server_client_check_redraw: ENTRY c=%p session=%p\n",
+		(void*)c, (void*)s);
+#endif
+
+	/* Safety check for NULL pointer chain */
+	if (s == NULL || s->curw == NULL || s->curw->window == NULL) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("server_client_check_redraw: NULL session/curw/window, returning\n");
+#endif
+		return;
+	}
+	w = s->curw->window;
+
+#ifdef PLATFORM_WINDOWS
+	win32_log("server_client_check_redraw: window=%p\n", (void*)w);
+#endif
+
 	if (c->flags & (CLIENT_CONTROL|CLIENT_SUSPENDED))
 		return;
+
 	if (c->flags & CLIENT_ALLREDRAWFLAGS) {
 		log_debug("%s: redraw%s%s%s%s%s%s", c->name,
 		    (c->flags & CLIENT_REDRAWWINDOW) ? " window" : "",
@@ -3224,6 +3326,7 @@ server_client_check_redraw(struct client *c)
 		 * If not redrawing the entire window, check whether each pane
 		 * needs to be redrawn.
 		 */
+		bit = 0;
 		TAILQ_FOREACH(wp, &w->panes, entry) {
 			redraw_pane = 0;
 			redraw_scrollbar_only = 0;
@@ -3246,6 +3349,9 @@ server_client_check_redraw(struct client *c)
 				log_debug("%s: redrawing pane %%%u", __func__,
 				    wp->id);
 			}
+#ifdef PLATFORM_WINDOWS
+			win32_log("server_client_check_redraw: redrawing pane %p (id %u)\n", (void*)wp, wp->id);
+#endif
 			screen_redraw_pane(c, wp, redraw_scrollbar_only);
 		}
 		c->redraw_panes = 0;
@@ -3258,6 +3364,9 @@ server_client_check_redraw(struct client *c)
 			server_client_set_title(c);
 			server_client_set_path(c);
 		}
+#ifdef PLATFORM_WINDOWS
+		win32_log("server_client_check_redraw: redrawing screen\n");
+#endif
 		screen_redraw_screen(c);
 	}
 
@@ -3275,7 +3384,9 @@ server_client_check_redraw(struct client *c)
 		 * generated.
 		 */
 		c->redraw = EVBUFFER_LENGTH(tty->out);
-		log_debug("%s: redraw added %zu bytes", c->name, c->redraw);
+#ifdef PLATFORM_WINDOWS
+		win32_log("server_client_check_redraw: redraw added %zu bytes\n", c->redraw);
+#endif
 	}
 }
 
@@ -3331,6 +3442,14 @@ server_client_dispatch(struct imsg *imsg, void *arg)
 	struct client	*c = arg;
 	ssize_t		 datalen;
 	struct session	*s;
+
+#ifdef PLATFORM_WINDOWS
+    if (imsg != NULL) {
+        win32_log("server_client_dispatch: client %p, imsg type %d, len %d\n", c, imsg->hdr.type, imsg->hdr.len);
+    } else {
+        win32_log("server_client_dispatch: client %p, imsg=NULL (lost connection)\n", c);
+    }
+#endif
 
 	if (c->flags & CLIENT_DEAD)
 		return;
@@ -3426,11 +3545,22 @@ server_client_dispatch(struct imsg *imsg, void *arg)
 	case MSG_READ_DONE:
 		file_read_done(&c->files, imsg);
 		break;
+	case MSG_TTY_INPUT:
+		if (datalen == 0)
+			break;
+		if (c->flags & CLIENT_TERMINAL) {
+			evbuffer_add(c->tty.in, imsg->data, datalen);
+			tty_keys_next(&c->tty);
+		}
+		break;
 	}
 
 	return;
 
 bad:
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_client_dispatch: BAD label hit, client %p, type %d\n", c, imsg->hdr.type);
+#endif
 	log_debug("client %p invalid message type %d", c, imsg->hdr.type);
 	proc_kill_peer(c->peer);
 }
@@ -3467,8 +3597,16 @@ server_client_command_done(struct cmdq_item *item, __unused void *data)
 {
 	struct client	*c = cmdq_get_client(item);
 
-	if (~c->flags & CLIENT_ATTACHED)
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_client_command_done: client %p, flags %#llx\n", c, c->flags);
+#endif
+
+	if (~c->flags & CLIENT_ATTACHED) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("server_client_command_done: setting CLIENT_EXIT for unattached client\n");
+#endif
 		c->flags |= CLIENT_EXIT;
+    }
 	else if (~c->flags & CLIENT_EXIT) {
 		if (c->flags & CLIENT_CONTROL)
 			control_ready(c);
@@ -3507,6 +3645,13 @@ server_client_dispatch_command(struct client *c, struct imsg *imsg)
 		goto error;
 	}
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_client_dispatch_command: client %p, argc %d\n", c, data.argc);
+    for (int i = 0; i < data.argc; i++) {
+        win32_log("  argv[%d] = %s\n", i, argv[i]);
+    }
+#endif
+
 	argc = data.argc;
 	if (argc == 0) {
 		new_item = cmdq_get_callback(server_client_default_command,
@@ -3538,6 +3683,9 @@ server_client_dispatch_command(struct client *c, struct imsg *imsg)
 	return (0);
 
 error:
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_client_dispatch_command: error, cause: %s\n", cause);
+#endif
 	cmd_free_argv(argc, argv);
 
 	cmdq_append(c, cmdq_get_error(cause));
@@ -3610,12 +3758,18 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 	case MSG_IDENTIFY_CWD:
 		if (datalen == 0 || data[datalen - 1] != '\0')
 			return (-1);
+#ifdef PLATFORM_WINDOWS
+        win32_log("server_client_dispatch_identify: CWD %s\n", data);
+#endif
 		if (access(data, X_OK) == 0)
 			c->cwd = xstrdup(data);
 		else if ((home = find_home()) != NULL)
 			c->cwd = xstrdup(home);
 		else
 			c->cwd = xstrdup("/");
+#ifdef PLATFORM_WINDOWS
+        win32_log("server_client_dispatch_identify: CWD processing done\n");
+#endif
 		log_debug("client %p IDENTIFY_CWD %s", c, data);
 		break;
 	case MSG_IDENTIFY_STDIN:
@@ -3625,16 +3779,38 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 		log_debug("client %p IDENTIFY_STDIN %d", c, c->fd);
 		break;
 	case MSG_IDENTIFY_STDOUT:
+#ifdef PLATFORM_WINDOWS
+		if (datalen == sizeof(struct winsize)) {
+			struct winsize ws;
+			memcpy(&ws, data, sizeof ws);
+			c->term_sx = ws.ws_col;
+			c->term_sy = ws.ws_row;
+			c->term_xpixel = ws.ws_xpixel;
+			c->term_ypixel = ws.ws_ypixel;
+			win32_log("client %p IDENTIFY_STDOUT size %ux%u\n", c, c->term_sx, c->term_sy);
+		}
+#endif
+#ifndef PLATFORM_WINDOWS
 		if (datalen != 0)
 			return (-1);
+#else
+		if (datalen != 0 && datalen != sizeof (struct winsize))
+			return (-1);
+#endif
 		c->out_fd = imsg_get_fd(imsg);
 		log_debug("client %p IDENTIFY_STDOUT %d", c, c->out_fd);
 		break;
 	case MSG_IDENTIFY_ENVIRON:
 		if (datalen == 0 || data[datalen - 1] != '\0')
 			return (-1);
+#ifdef PLATFORM_WINDOWS
+        win32_log("server_client_dispatch_identify: ENVIRON %s\n", data);
+#endif
 		if (strchr(data, '=') != NULL)
 			environ_put(c->environ, data, 0);
+#ifdef PLATFORM_WINDOWS
+        win32_log("server_client_dispatch_identify: ENVIRON processing done\n");
+#endif
 		log_debug("client %p IDENTIFY_ENVIRON %s", c, data);
 		break;
 	case MSG_IDENTIFY_CLIENTPID:
@@ -3670,7 +3846,11 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 
 	if (c->flags & CLIENT_CONTROL)
 		control_start(c);
+#ifdef PLATFORM_WINDOWS
+	else if (1) {
+#else
 	else if (c->fd != -1) {
+#endif
 		if (tty_init(&c->tty, c) != 0) {
 			close(c->fd);
 			c->fd = -1;

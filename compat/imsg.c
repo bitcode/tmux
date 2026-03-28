@@ -121,8 +121,16 @@ imsgbuf_get(struct imsgbuf *imsgbuf, struct imsg *imsg)
 	if ((buf = msgbuf_get(imsgbuf->w)) == NULL)
 		return (0);
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("imsgbuf_get: retrieved buf %p\n", buf);
+#endif
+
 	if (ibuf_get(buf, &m.hdr, sizeof(m.hdr)) == -1)
 		return (-1);
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("imsgbuf_get: retrieved type %d, len %d, buf %p\n", m.hdr.type, m.hdr.len, buf);
+#endif
 
 	if (ibuf_size(buf))
 		m.data = ibuf_data(buf);
@@ -436,6 +444,10 @@ imsg_parse_hdr(struct ibuf *buf, void *arg, int *fd)
 
 	if (ibuf_get(buf, &hdr, sizeof(hdr)) == -1)
 		return (NULL);
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("imsg_parse_hdr: type=%d, len=%d, peerid=%d, pid=%d\n", hdr.type, hdr.len, hdr.peerid, hdr.pid);
+#endif
 
 	len = hdr.len & ~IMSG_FD_MARK;
 

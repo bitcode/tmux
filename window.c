@@ -1029,6 +1029,11 @@ window_pane_read_callback(__unused struct bufferevent *bufev, void *data)
 	size_t				 new_size;
 	struct client			*c;
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("window_pane_read_callback: ENTRY! wp=%p, bufev=%p, wp->event=%p, size=%zu\n",
+		(void*)wp, (void*)bufev, (void*)(wp ? wp->event : NULL), size);
+#endif
+
 	if (wp->pipe_fd != -1) {
 		new_data = window_pane_get_new_data(wp, wpo, &new_size);
 		if (new_size > 0) {

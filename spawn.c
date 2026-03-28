@@ -223,6 +223,9 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	key_code		  key;
 
 	spawn_log(__func__, sc);
+#ifdef PLATFORM_WINDOWS
+    win32_log("spawn_pane: entry, flags=%x\n", sc->flags);
+#endif
 
 	/*
 	 * Work out the current working directory. If respawning, use
@@ -298,6 +301,9 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		free(new_wp->cwd);
 		new_wp->cwd = cwd;
 	}
+#ifdef PLATFORM_WINDOWS
+    win32_log("spawn_pane: args resolved, argc=%d\n", argc);
+#endif
 
 	/*
 	 * Replace the stored arguments if there are new ones. If not, the
@@ -337,6 +343,10 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		new_wp->shell = xstrdup(tmp);
 	}
 	environ_set(child, "SHELL", 0, "%s", new_wp->shell);
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("spawn_pane: shell=%s, blocking signals\n", new_wp->shell);
+#endif
 
 	/* Log the arguments we are going to use. */
 	log_debug("%s: shell=%s", __func__, new_wp->shell);
@@ -379,7 +389,15 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	}
 
 	/* Fork the new process. */
+	/* Fork the new process. */
+#ifdef PLATFORM_WINDOWS
+    win32_log("spawn_pane: calling win32_spawn_process\n");
+    /* On Windows, we cannot fork. Use win32_spawn_process to launch command with PTY. */
+    new_wp->pid = win32_spawn_process(&new_wp->fd, new_wp->tty, &ws, new_wp->argc, new_wp->argv, child);
+    win32_log("spawn_pane: win32_spawn_process returned pid=%ld, fd=%d\n", (long)new_wp->pid, new_wp->fd);
+#else
 	new_wp->pid = fdforkpty(ptm_fd, &new_wp->fd, new_wp->tty, NULL, &ws);
+#endif
 	if (new_wp->pid == -1) {
 		xasprintf(cause, "fork failed: %s", strerror(errno));
 		new_wp->fd = -1;

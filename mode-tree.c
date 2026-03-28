@@ -716,10 +716,12 @@ mode_tree_draw(struct mode_tree_data *mtd)
 	char			*text, *start, *key;
 	const char		*tag, *symbol;
 	size_t			 size, n;
-	int			 keylen, pad, alignlen[mtd->maxdepth + 1];
+	int			 keylen, pad, *alignlen;
 
 	if (mtd->line_size == 0)
 		return;
+
+	alignlen = xmalloc((mtd->maxdepth + 1) * sizeof *alignlen);
 
 	memcpy(&gc0, &grid_default_cell, sizeof gc0);
 	memcpy(&gc, &grid_default_cell, sizeof gc);
@@ -885,6 +887,7 @@ mode_tree_draw(struct mode_tree_data *mtd)
 		mtd->drawcb(mtd->modedata, mti->itemdata, &ctx, box_x, box_y);
 	}
 
+	free(alignlen);
 done:
 	screen_write_cursormove(&ctx, 0, mtd->current - mtd->offset, 0);
 	screen_write_stop(&ctx);

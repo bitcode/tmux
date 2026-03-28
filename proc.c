@@ -22,6 +22,7 @@
 #include <sys/utsname.h>
 
 #include <errno.h>
+#include <locale.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,8 +78,16 @@ proc_event_cb(__unused int fd, short events, void *arg)
 	ssize_t		 n;
 	struct imsg	 imsg;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_event_cb: fd=%d, events=%d, peer=%p, ibuf.fd=%d\n", fd, (int)events, peer, peer->ibuf.fd);
+#endif
+
 	if (!(peer->flags & PEER_BAD) && (events & EV_READ)) {
-		if (imsgbuf_read(&peer->ibuf) != 1) {
+        int read_ret = imsgbuf_read(&peer->ibuf);
+#ifdef PLATFORM_WINDOWS
+        win32_log("proc_event_cb: imsgbuf_read returned %d\n", read_ret);
+#endif
+		if (read_ret != 1) {
 			peer->dispatchcb(NULL, peer->arg);
 			return;
 		}
@@ -90,6 +99,9 @@ proc_event_cb(__unused int fd, short events, void *arg)
 			if (n == 0)
 				break;
 			log_debug("peer %p message %d", peer, imsg.hdr.type);
+#ifdef PLATFORM_WINDOWS
+            win32_log("proc_event_cb: got imsg type %d\n", imsg.hdr.type);
+#endif
 
 			if (peer_check_version(peer, &imsg) != 0) {
 				imsg_free(&imsg);
@@ -181,27 +193,42 @@ proc_start(const char *name)
 	struct tmuxproc	*tp;
 	struct utsname	 u;
 
-	log_open(name);
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_start: calling log_open\n");
+#endif
+	//log_open(name);
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_start: calling setproctitle\n");
+#endif
 	setproctitle("%s (%s)", name, socket_path);
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_start: calling uname\n");
+#endif
 	if (uname(&u) < 0)
 		memset(&u, 0, sizeof u);
 
-	log_debug("%s started (%ld): version %s, socket %s, protocol %d", name,
-	    (long)getpid(), getversion(), socket_path, PROTOCOL_VERSION);
-	log_debug("on %s %s %s", u.sysname, u.release, u.version);
-	log_debug("using libevent %s %s", event_get_version(), event_get_method());
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_start: uname done\n");
+#endif
+//	log_debug("%s started (%ld): version %s, socket %s, protocol %d", name,
+//	    (long)getpid(), getversion(), socket_path, PROTOCOL_VERSION);
+//	log_debug("on %s %s %s", u.sysname, u.release, u.version);
+//	log_debug("using libevent %s %s", event_get_version(), event_get_method());
 #ifdef HAVE_UTF8PROC
-	log_debug("using utf8proc %s", utf8proc_version());
+//	log_debug("using utf8proc %s", utf8proc_version());
 #endif
 #ifdef NCURSES_VERSION
-	log_debug("using ncurses %s %06u", NCURSES_VERSION, NCURSES_VERSION_PATCH);
+//	log_debug("using ncurses %s %06u", NCURSES_VERSION, NCURSES_VERSION_PATCH);
 #endif
 
 	tp = xcalloc(1, sizeof *tp);
 	tp->name = xstrdup(name);
 	TAILQ_INIT(&tp->peers);
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_start: returning\n");
+#endif
 	return (tp);
 }
 
@@ -209,10 +236,22 @@ void
 proc_loop(struct tmuxproc *tp, int (*loopcb)(void))
 {
 	log_debug("%s loop enter", tp->name);
-	do
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_loop: %s loop enter, loopcb=%p\n", tp->name, loopcb);
+#endif
+	do {
+#ifdef PLATFORM_WINDOWS
+        win32_log("proc_loop: calling event_loop(EVLOOP_ONCE)\n");
+#endif
 		event_loop(EVLOOP_ONCE);
-	while (!tp->exit && (loopcb == NULL || !loopcb ()));
+#ifdef PLATFORM_WINDOWS
+        win32_log("proc_loop: event_loop returned\n");
+#endif
+    } while (!tp->exit && (loopcb == NULL || !loopcb ()));
 	log_debug("%s loop exit", tp->name);
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_loop: %s loop exit\n", tp->name);
+#endif
 }
 
 void
@@ -230,6 +269,9 @@ proc_set_signals(struct tmuxproc *tp, void (*signalcb)(int))
 {
 	struct sigaction	sa;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_set_signals: entered\n");
+#endif
 	tp->signalcb = signalcb;
 
 	memset(&sa, 0, sizeof sa);
@@ -237,12 +279,21 @@ proc_set_signals(struct tmuxproc *tp, void (*signalcb)(int))
 	sa.sa_flags = SA_RESTART;
 	sa.sa_handler = SIG_IGN;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_set_signals: calling sigaction\n");
+#endif
 	sigaction(SIGPIPE, &sa, NULL);
 	sigaction(SIGTSTP, &sa, NULL);
 	sigaction(SIGTTIN, &sa, NULL);
 	sigaction(SIGTTOU, &sa, NULL);
 	sigaction(SIGQUIT, &sa, NULL);
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_set_signals: calling signal_set/add\n");
+#endif
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_set_signals: skipping signal_set on Windows\n");
+#else
 	signal_set(&tp->ev_sigint, SIGINT, proc_signal_cb, tp);
 	signal_add(&tp->ev_sigint, NULL);
 	signal_set(&tp->ev_sighup, SIGHUP, proc_signal_cb, tp);
@@ -259,6 +310,10 @@ proc_set_signals(struct tmuxproc *tp, void (*signalcb)(int))
 	signal_add(&tp->ev_sigusr2, NULL);
 	signal_set(&tp->ev_sigwinch, SIGWINCH, proc_signal_cb, tp);
 	signal_add(&tp->ev_sigwinch, NULL);
+#endif
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_set_signals: done\n");
+#endif
 }
 
 void
@@ -303,6 +358,10 @@ proc_add_peer(struct tmuxproc *tp, int fd,
 	struct tmuxpeer	*peer;
 	gid_t		 gid;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_add_peer: tp=%s, fd=%d\n", tp->name, fd);
+#endif
+
 	peer = xcalloc(1, sizeof *peer);
 	peer->parent = tp;
 
@@ -340,6 +399,9 @@ proc_remove_peer(struct tmuxpeer *peer)
 void
 proc_kill_peer(struct tmuxpeer *peer)
 {
+#ifdef PLATFORM_WINDOWS
+    win32_log("proc_kill_peer: peer=%p\n", peer);
+#endif
 	peer->flags |= PEER_BAD;
 }
 
@@ -358,6 +420,8 @@ proc_toggle_log(struct tmuxproc *tp)
 pid_t
 proc_fork_and_daemon(int *fd)
 {
+	setlocale(LC_TIME, "");
+	setlocale(LC_CTYPE, "");
 	pid_t	pid;
 	int	pair[2];
 

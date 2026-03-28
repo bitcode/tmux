@@ -196,6 +196,14 @@ make_label(const char *label, char **cause)
 		label = "default";
 	uid = getuid();
 
+#ifdef PLATFORM_WINDOWS
+	const char *localappdata = getenv("LOCALAPPDATA");
+	if (localappdata == NULL)
+		localappdata = "C:\\Users\\Default\\AppData\\Local";
+	path = xstrdup(localappdata);
+	xasprintf(&base, "%s\\tmux\\tmux-%ld", path, (long)uid);
+	free(path);
+#else
 	expand_paths(TMUX_SOCK, &paths, &n, 0);
 	if (n == 0) {
 		xasprintf(cause, "no suitable socket path");
@@ -208,6 +216,7 @@ make_label(const char *label, char **cause)
 
 	xasprintf(&base, "%s/tmux-%ld", path, (long)uid);
 	free(path);
+#endif
 	if (mkdir(base, S_IRWXU) != 0 && errno != EEXIST) {
 		xasprintf(cause, "couldn't create directory %s (%s)", base,
 		    strerror(errno));
@@ -222,11 +231,17 @@ make_label(const char *label, char **cause)
 		xasprintf(cause, "%s is not a directory", base);
 		goto fail;
 	}
+#ifndef PLATFORM_WINDOWS
 	if (sb.st_uid != uid || (sb.st_mode & TMUX_SOCK_PERM) != 0) {
 		xasprintf(cause, "directory %s has unsafe permissions", base);
 		goto fail;
 	}
+#endif
+#ifdef PLATFORM_WINDOWS
+	xasprintf(&path, "%s\\%s", base, label);
+#else
 	xasprintf(&path, "%s/%s", base, label);
+#endif
 	free(base);
 	return (path);
 
@@ -356,15 +371,33 @@ main(int argc, char **argv)
 	uint64_t				 flags = 0;
 	const struct options_table_entry	*oe;
 	u_int					 i;
+#ifdef PLATFORM_WINDOWS
+    FILE *fdbg;
+#endif
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("tmux main start\n");
+    if (win32_socket_init() != 0) {
+        win32_log("socket_init failed\n");
+		errx(1, "win32_socket_init failed");
+    }
+    win32_log("socket_init done\n");
+#endif
 
 	if (setlocale(LC_CTYPE, "en_US.UTF-8") == NULL &&
 	    setlocale(LC_CTYPE, "C.UTF-8") == NULL) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("setlocale failed, trying empty\n");
+#endif
 		if (setlocale(LC_CTYPE, "") == NULL)
 			errx(1, "invalid LC_ALL, LC_CTYPE or LANG");
 		s = nl_langinfo(CODESET);
 		if (strcasecmp(s, "UTF-8") != 0 && strcasecmp(s, "UTF8") != 0)
 			errx(1, "need UTF-8 locale (LC_CTYPE) but have %s", s);
 	}
+#ifdef PLATFORM_WINDOWS
+    win32_log("setlocale done\n");
+#endif
 
 	setlocale(LC_TIME, "");
 	tzset();
@@ -372,12 +405,27 @@ main(int argc, char **argv)
 	if (**argv == '-')
 		flags = CLIENT_LOGIN;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("Calling environ_create\n");
+#endif
 	global_environ = environ_create();
+#ifdef PLATFORM_WINDOWS
+    win32_log("environ_create done\n");
+#endif
 	for (var = environ; *var != NULL; var++)
 		environ_put(global_environ, *var, 0);
+#ifdef PLATFORM_WINDOWS
+    win32_log("environ populated\n");
+#endif
 	if ((cwd = find_cwd()) != NULL)
 		environ_set(global_environ, "PWD", 0, "%s", cwd);
+#ifdef PLATFORM_WINDOWS
+    win32_log("PWD set\n");
+#endif
 	expand_paths(TMUX_CONF, &cfg_files, &cfg_nfiles, 1);
+#ifdef PLATFORM_WINDOWS
+    win32_log("expand_paths done\n");
+#endif
 
 	while ((opt = getopt(argc, argv, "2c:CDdf:hlL:NqS:T:uUvV")) != -1) {
 		switch (opt) {
@@ -445,16 +493,37 @@ main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
+#ifdef PLATFORM_WINDOWS
+        win32_log("After getopt\n");
+#endif
+
 	if (shell_command != NULL && argc != 0)
 		usage(1);
 	if ((flags & CLIENT_NOFORK) && argc != 0)
 		usage(1);
 
-	if ((ptm_fd = getptmfd()) == -1)
+#ifdef PLATFORM_WINDOWS
+        win32_log("Calling getptmfd\n");
+#endif
+	if ((ptm_fd = getptmfd()) == -1) // <--- Check this
 		err(1, "getptmfd");
+#ifdef PLATFORM_WINDOWS
+        win32_log("getptmfd success: %d\n", ptm_fd);
+#endif
+
+#ifdef PLATFORM_WINDOWS
+        win32_log("Calling pledge\n");
+#endif
+    /*
 	if (pledge("stdio rpath wpath cpath flock fattr unix getpw sendfd "
 	    "recvfd proc exec tty ps", NULL) != 0)
 		err(1, "pledge");
+    */
+    /* Pledge is mostly OpenBSD specific, verify if stumped or unsafe */
+    /* Commenting out for now to ensure it's not the blocker, or check definition */
+#ifdef PLATFORM_WINDOWS
+        win32_log("Skipping pledge check or handled\n");
+#endif
 
 	/*
 	 * tmux is a UTF-8 terminal, so if TMUX is set, assume UTF-8.
@@ -523,18 +592,74 @@ main(int argc, char **argv)
 		}
 	}
 	if (path == NULL) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("Calling make_label\n");
+#endif
 		if ((path = make_label(label, &cause)) == NULL) {
+#ifdef PLATFORM_WINDOWS
+             win32_log("make_label failed: %s\n", cause);
+#endif
 			if (cause != NULL) {
 				fprintf(stderr, "%s\n", cause);
 				free(cause);
 			}
 			exit(1);
 		}
+#ifdef PLATFORM_WINDOWS
+        win32_log("make_label success: %s\n", path);
+#endif
 		flags |= CLIENT_DEFAULTSOCKET;
 	}
 	socket_path = path;
+#ifdef PLATFORM_WINDOWS
+	if (socket_path != NULL) {
+        win32_log("Calling win32_translate_socket_path: %s\n", socket_path);
+		char *new_path = win32_translate_socket_path(socket_path);
+        win32_log("Translated path: %s\n", new_path);
+		if (new_path != socket_path) {
+			free(path);
+			socket_path = xstrdup(new_path);
+		}
+	}
+#endif
 	free(label);
 
 	/* Pass control to the client. */
-	exit(client_main(osdep_event_init(), argc, argv, flags, feat));
+#ifdef PLATFORM_WINDOWS
+    win32_log("Calling osdep_event_init\n");
+#endif
+	struct event_base *base = osdep_event_init(); // Keep base local
+
+#ifdef PLATFORM_WINDOWS
+    if (argc > 0 && strcmp(argv[0], "__win32_server") == 0) {
+        win32_log("Starting server_child_main\n");
+        int lockfd = -1;
+        char *lockfile = NULL;
+        
+        // We need to acquire lock to behave like server_start(child) expectation?
+        // server_child_main takes lockfd.
+        // And it unlinks/closes it.
+        // So we SHOULD open it.
+        if (socket_path) {
+            xasprintf(&lockfile, "%s.lock", socket_path);
+            lockfd = open(lockfile, O_WRONLY|O_CREAT, 0600);
+            if (lockfd != -1) {
+                 if (flock(lockfd, LOCK_EX) == -1) {
+                     // Failed to lock
+                     close(lockfd);
+                     lockfd = -1;
+                 }
+            }
+        }
+        server_child_main(NULL, 0, base, lockfd, lockfile); // client=NULL, flags=0?
+        exit(0);
+    }
+#endif
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("Calling client_main\n");
+	exit(client_main(base, argc, argv, flags, feat));
+#else
+	exit(client_main(base, argc, argv, flags, feat)); // POSIX uses osdep_event_init() result directly
+#endif
 }

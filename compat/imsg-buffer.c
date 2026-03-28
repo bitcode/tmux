@@ -29,8 +29,20 @@
 #include <string.h>
 #include <unistd.h>
 
+
 #include "compat.h"
 #include "imsg.h"
+
+/* Brute force undefine macros on Windows to fix collisions */
+/*
+#undef msg_name
+#undef msg_namelen
+#undef msg_iov
+#undef msg_iovlen
+#undef msg_control
+#undef msg_controllen
+#undef msg_flags
+*/
 
 #undef htobe16
 #define htobe16 htons
@@ -49,6 +61,7 @@ struct ibufqueue {
 	TAILQ_HEAD(, ibuf)	bufs;
 	uint32_t		queued;
 };
+
 
 struct msgbuf {
 	struct ibufqueue	 bufs;
@@ -747,8 +760,15 @@ ibuf_write(int fd, struct msgbuf *msgbuf)
 		if (errno == EAGAIN || errno == ENOBUFS)
 			/* lets retry later again */
 			return (0);
+#ifdef PLATFORM_WINDOWS
+        win32_log("ibuf_write: writev failed fd=%d, errno=%d\n", fd, errno);
+#endif
 		return (-1);
 	}
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("ibuf_write: writev success fd=%d, n=%zd\n", fd, n);
+#endif
 
 	msgbuf_drain(msgbuf, n);
 	return (0);
@@ -806,8 +826,15 @@ msgbuf_write(int fd, struct msgbuf *msgbuf)
 		if (errno == EAGAIN || errno == ENOBUFS)
 			/* lets retry later again */
 			return (0);
+#ifdef PLATFORM_WINDOWS
+        win32_log("msgbuf_write: sendmsg failed fd=%d, errno=%d\n", fd, errno);
+#endif
 		return (-1);
 	}
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("msgbuf_write: sendmsg success fd=%d, n=%zd\n", fd, n);
+#endif
 
 	/*
 	 * assumption: fd got sent if sendmsg sent anything
@@ -829,6 +856,10 @@ ibuf_read_process(struct msgbuf *msgbuf, int fd)
 	struct ibuf rbuf, msg;
 	ssize_t sz;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("ibuf_read_process: entry, roff=%zd\n", msgbuf->roff);
+#endif
+
 	ibuf_from_buffer(&rbuf, msgbuf->rbuf, msgbuf->roff);
 
 	do {
@@ -838,9 +869,16 @@ ibuf_read_process(struct msgbuf *msgbuf, int fd)
 			/* get size from header */
 			ibuf_from_buffer(&msg, ibuf_data(&rbuf),
 			    msgbuf->hdrsize);
+#ifdef PLATFORM_WINDOWS
+            win32_log("ibuf_read_process: calling readhdr, rbuf size=%zd\n", ibuf_size(&rbuf));
+#endif
 			if ((msgbuf->rpmsg = msgbuf->readhdr(&msg,
-			    msgbuf->rarg, &fd)) == NULL)
+			    msgbuf->rarg, &fd)) == NULL) {
+#ifdef PLATFORM_WINDOWS
+                win32_log("ibuf_read_process: readhdr failed\n");
+#endif
 				goto fail;
+            }
 		}
 
 		if (ibuf_left(msgbuf->rpmsg) <= ibuf_size(&rbuf))
@@ -854,6 +892,9 @@ ibuf_read_process(struct msgbuf *msgbuf, int fd)
 			goto fail;
 
 		if (ibuf_left(msgbuf->rpmsg) == 0) {
+#ifdef PLATFORM_WINDOWS
+            win32_log("ibuf_read_process: pushing imsg to queue\n");
+#endif
 			ibufq_push(&msgbuf->rbufs, msgbuf->rpmsg);
 			msgbuf->rpmsg = NULL;
 		}
@@ -865,6 +906,9 @@ ibuf_read_process(struct msgbuf *msgbuf, int fd)
 
 	if (fd != -1)
 		close(fd);
+#ifdef PLATFORM_WINDOWS
+    win32_log("ibuf_read_process: success exit\n");
+#endif
 	return (1);
 
  fail:
@@ -947,10 +991,17 @@ again:
 		if (errno == EAGAIN)
 			/* lets retry later again */
 			return (1);
+#ifdef PLATFORM_WINDOWS
+        win32_log("msgbuf_read: recvmsg failed fd=%d, errno=%d\n", fd, errno);
+#endif
 		return (-1);
 	}
 	if (n == 0)	/* connection closed */
 		return (0);
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("msgbuf_read: recvmsg success fd=%d, n=%zd\n", fd, n);
+#endif
 
 	msgbuf->roff += n;
 
@@ -979,7 +1030,11 @@ again:
 	}
 
 	/* new data arrived, try to process it */
-	return (ibuf_read_process(msgbuf, fdpass));
+	int ret = ibuf_read_process(msgbuf, fdpass);
+#ifdef PLATFORM_WINDOWS
+    win32_log("msgbuf_read: ibuf_read_process returned %d\n", ret);
+#endif
+	return ret;
 }
 
 static void

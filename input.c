@@ -264,6 +264,7 @@ enum input_csi_type {
 	INPUT_CSI_CUP,
 	INPUT_CSI_CUU,
 	INPUT_CSI_DA,
+	INPUT_CSI_DA_RESPONSE,
 	INPUT_CSI_DA_TWO,
 	INPUT_CSI_DCH,
 	INPUT_CSI_DECSCUSR,
@@ -321,6 +322,7 @@ static const struct input_table_entry input_csi_table[] = {
 	{ '`', "",  INPUT_CSI_HPA },
 	{ 'b', "",  INPUT_CSI_REP },
 	{ 'c', "",  INPUT_CSI_DA },
+	{ 'c', "?", INPUT_CSI_DA_RESPONSE },
 	{ 'c', ">", INPUT_CSI_DA_TWO },
 	{ 'd', "",  INPUT_CSI_VPA },
 	{ 'f', "",  INPUT_CSI_CUP },
@@ -367,142 +369,27 @@ struct input_state {
 	{ 0x1b, 0x1b, NULL,		 &input_state_esc_enter }
 
 /* Forward declarations of state tables. */
-static const struct input_transition input_state_ground_table[];
-static const struct input_transition input_state_esc_enter_table[];
-static const struct input_transition input_state_esc_intermediate_table[];
-static const struct input_transition input_state_csi_enter_table[];
-static const struct input_transition input_state_csi_parameter_table[];
-static const struct input_transition input_state_csi_intermediate_table[];
-static const struct input_transition input_state_csi_ignore_table[];
-static const struct input_transition input_state_dcs_enter_table[];
-static const struct input_transition input_state_dcs_parameter_table[];
-static const struct input_transition input_state_dcs_intermediate_table[];
-static const struct input_transition input_state_dcs_handler_table[];
-static const struct input_transition input_state_dcs_escape_table[];
-static const struct input_transition input_state_dcs_ignore_table[];
-static const struct input_transition input_state_osc_string_table[];
-static const struct input_transition input_state_apc_string_table[];
-static const struct input_transition input_state_rename_string_table[];
-static const struct input_transition input_state_consume_st_table[];
+/* Forward declarations of states. */
+static const struct input_state input_state_ground;
+static const struct input_state input_state_esc_enter;
+static const struct input_state input_state_esc_intermediate;
+static const struct input_state input_state_csi_enter;
+static const struct input_state input_state_csi_parameter;
+static const struct input_state input_state_csi_intermediate;
+static const struct input_state input_state_csi_ignore;
+static const struct input_state input_state_dcs_enter;
+static const struct input_state input_state_dcs_parameter;
+static const struct input_state input_state_dcs_intermediate;
+static const struct input_state input_state_dcs_handler;
+static const struct input_state input_state_dcs_escape;
+static const struct input_state input_state_dcs_ignore;
+static const struct input_state input_state_osc_string;
+static const struct input_state input_state_apc_string;
+static const struct input_state input_state_rename_string;
+static const struct input_state input_state_consume_st;
 
-/* ground state definition. */
-static const struct input_state input_state_ground = {
-	"ground",
-	input_ground, NULL,
-	input_state_ground_table
-};
 
-/* esc_enter state definition. */
-static const struct input_state input_state_esc_enter = {
-	"esc_enter",
-	input_clear, NULL,
-	input_state_esc_enter_table
-};
 
-/* esc_intermediate state definition. */
-static const struct input_state input_state_esc_intermediate = {
-	"esc_intermediate",
-	NULL, NULL,
-	input_state_esc_intermediate_table
-};
-
-/* csi_enter state definition. */
-static const struct input_state input_state_csi_enter = {
-	"csi_enter",
-	input_clear, NULL,
-	input_state_csi_enter_table
-};
-
-/* csi_parameter state definition. */
-static const struct input_state input_state_csi_parameter = {
-	"csi_parameter",
-	NULL, NULL,
-	input_state_csi_parameter_table
-};
-
-/* csi_intermediate state definition. */
-static const struct input_state input_state_csi_intermediate = {
-	"csi_intermediate",
-	NULL, NULL,
-	input_state_csi_intermediate_table
-};
-
-/* csi_ignore state definition. */
-static const struct input_state input_state_csi_ignore = {
-	"csi_ignore",
-	NULL, NULL,
-	input_state_csi_ignore_table
-};
-
-/* dcs_enter state definition. */
-static const struct input_state input_state_dcs_enter = {
-	"dcs_enter",
-	input_enter_dcs, NULL,
-	input_state_dcs_enter_table
-};
-
-/* dcs_parameter state definition. */
-static const struct input_state input_state_dcs_parameter = {
-	"dcs_parameter",
-	NULL, NULL,
-	input_state_dcs_parameter_table
-};
-
-/* dcs_intermediate state definition. */
-static const struct input_state input_state_dcs_intermediate = {
-	"dcs_intermediate",
-	NULL, NULL,
-	input_state_dcs_intermediate_table
-};
-
-/* dcs_handler state definition. */
-static const struct input_state input_state_dcs_handler = {
-	"dcs_handler",
-	NULL, NULL,
-	input_state_dcs_handler_table
-};
-
-/* dcs_escape state definition. */
-static const struct input_state input_state_dcs_escape = {
-	"dcs_escape",
-	NULL, NULL,
-	input_state_dcs_escape_table
-};
-
-/* dcs_ignore state definition. */
-static const struct input_state input_state_dcs_ignore = {
-	"dcs_ignore",
-	NULL, NULL,
-	input_state_dcs_ignore_table
-};
-
-/* osc_string state definition. */
-static const struct input_state input_state_osc_string = {
-	"osc_string",
-	input_enter_osc, input_exit_osc,
-	input_state_osc_string_table
-};
-
-/* apc_string state definition. */
-static const struct input_state input_state_apc_string = {
-	"apc_string",
-	input_enter_apc, input_exit_apc,
-	input_state_apc_string_table
-};
-
-/* rename_string state definition. */
-static const struct input_state input_state_rename_string = {
-	"rename_string",
-	input_enter_rename, input_exit_rename,
-	input_state_rename_string_table
-};
-
-/* consume_st state definition. */
-static const struct input_state input_state_consume_st = {
-	"consume_st",
-	input_enter_rename, NULL, /* rename also waits for ST */
-	input_state_consume_st_table
-};
 
 /* ground state table. */
 static const struct input_transition input_state_ground_table[] = {
@@ -757,6 +644,125 @@ static const struct input_transition input_state_consume_st_table[] = {
 	{ 0x20, 0xff, NULL,	    NULL },
 
 	{ -1, -1, NULL, NULL }
+};
+
+/* ground state definition. */
+static const struct input_state input_state_ground = {
+	"ground",
+	input_ground, NULL,
+	input_state_ground_table
+};
+
+/* esc_enter state definition. */
+static const struct input_state input_state_esc_enter = {
+	"esc_enter",
+	input_clear, NULL,
+	input_state_esc_enter_table
+};
+
+/* esc_intermediate state definition. */
+static const struct input_state input_state_esc_intermediate = {
+	"esc_intermediate",
+	NULL, NULL,
+	input_state_esc_intermediate_table
+};
+
+/* csi_enter state definition. */
+static const struct input_state input_state_csi_enter = {
+	"csi_enter",
+	input_clear, NULL,
+	input_state_csi_enter_table
+};
+
+/* csi_parameter state definition. */
+static const struct input_state input_state_csi_parameter = {
+	"csi_parameter",
+	NULL, NULL,
+	input_state_csi_parameter_table
+};
+
+/* csi_intermediate state definition. */
+static const struct input_state input_state_csi_intermediate = {
+	"csi_intermediate",
+	NULL, NULL,
+	input_state_csi_intermediate_table
+};
+
+/* csi_ignore state definition. */
+static const struct input_state input_state_csi_ignore = {
+	"csi_ignore",
+	NULL, NULL,
+	input_state_csi_ignore_table
+};
+
+/* dcs_enter state definition. */
+static const struct input_state input_state_dcs_enter = {
+	"dcs_enter",
+	input_enter_dcs, NULL,
+	input_state_dcs_enter_table
+};
+
+/* dcs_parameter state definition. */
+static const struct input_state input_state_dcs_parameter = {
+	"dcs_parameter",
+	NULL, NULL,
+	input_state_dcs_parameter_table
+};
+
+/* dcs_intermediate state definition. */
+static const struct input_state input_state_dcs_intermediate = {
+	"dcs_intermediate",
+	NULL, NULL,
+	input_state_dcs_intermediate_table
+};
+
+/* dcs_handler state definition. */
+static const struct input_state input_state_dcs_handler = {
+	"dcs_handler",
+	NULL, NULL,
+	input_state_dcs_handler_table
+};
+
+/* dcs_escape state definition. */
+static const struct input_state input_state_dcs_escape = {
+	"dcs_escape",
+	NULL, NULL,
+	input_state_dcs_escape_table
+};
+
+/* dcs_ignore state definition. */
+static const struct input_state input_state_dcs_ignore = {
+	"dcs_ignore",
+	NULL, NULL,
+	input_state_dcs_ignore_table
+};
+
+/* osc_string state definition. */
+static const struct input_state input_state_osc_string = {
+	"osc_string",
+	input_enter_osc, input_exit_osc,
+	input_state_osc_string_table
+};
+
+/* apc_string state definition. */
+static const struct input_state input_state_apc_string = {
+	"apc_string",
+	input_enter_apc, input_exit_apc,
+	input_state_apc_string_table
+};
+
+/* rename_string state definition. */
+static const struct input_state input_state_rename_string = {
+	"rename_string",
+	input_enter_rename, input_exit_rename,
+	input_state_rename_string_table
+};
+
+/* consume_st state definition. */
+static const struct input_state input_state_consume_st = {
+	"consume_st",
+	input_enter_rename, NULL, /* rename also waits for ST */
+	input_state_consume_st_table
 };
 
 /* Maximum of bytes allowed to read in a single input. */
@@ -1566,6 +1572,14 @@ input_csi_dispatch(struct input_ctx *ictx)
 			log_debug("%s: unknown '%c'", __func__, ictx->ch);
 			break;
 		}
+		break;
+	case INPUT_CSI_DA_RESPONSE:
+		/*
+		 * DA response from the pane's terminal (e.g., ConPTY on Windows).
+		 * These are responses to DA queries, not commands. Silently consume
+		 * them instead of passing through as raw characters.
+		 */
+		log_debug("%s: DA response consumed", __func__);
 		break;
 	case INPUT_CSI_DA_TWO:
 		switch (input_get(ictx, 0, 0, 0)) {

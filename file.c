@@ -25,7 +25,13 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifdef PLATFORM_WINDOWS
+#include <io.h>        /* for _dup, _open_osfhandle */
+#include <windows.h>   /* for GetStdHandle */
+#endif
+
 #include "tmux.h"
+
 
 /*
  * IPC file handling. Both client and server use the same data structures
@@ -107,8 +113,10 @@ file_create_with_client(struct client *c, int stream, client_file_cb cb,
 {
 	struct client_file	*cf;
 
+#ifndef PLATFORM_WINDOWS
 	if (c != NULL && (c->flags & CLIENT_ATTACHED))
 		c = NULL;
+#endif
 
 	cf = xcalloc(1, sizeof *cf);
 	cf->c = c;
@@ -183,11 +191,17 @@ int
 file_can_print(struct client *c)
 {
 	if (c == NULL ||
-	    (c->flags & CLIENT_ATTACHED) ||
 	    (c->flags & CLIENT_CONTROL))
 		return (0);
+#ifndef PLATFORM_WINDOWS
+	/* On POSIX, attached clients have a valid tty fd - use direct write */
+	if (c->flags & CLIENT_ATTACHED)
+		return (0);
+#endif
+	/* On Windows, attached clients use IPC since we can't pass console handles */
 	return (1);
 }
+
 
 /* Print a message to a file. */
 void
@@ -234,6 +248,10 @@ file_print_buffer(struct client *c, void *data, size_t size)
 	struct client_file	 find, *cf;
 	struct msg_write_open	 msg;
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("file_print_buffer: c=%p size=%zu\n", (void*)c, size);
+#endif
+
 	if (!file_can_print(c))
 		return;
 
@@ -247,6 +265,10 @@ file_print_buffer(struct client *c, void *data, size_t size)
 		msg.stream = 1;
 		msg.fd = STDOUT_FILENO;
 		msg.flags = 0;
+#ifdef PLATFORM_WINDOWS
+		win32_log("file_print_buffer: sending MSG_WRITE_OPEN stream=%d fd=%d\n",
+			msg.stream, msg.fd);
+#endif
 		proc_send(c->peer, MSG_WRITE_OPEN, -1, &msg, sizeof msg);
 	} else {
 		evbuffer_add(cf->buffer, data, size);
@@ -254,7 +276,57 @@ file_print_buffer(struct client *c, void *data, size_t size)
 	}
 }
 
+
+#ifdef PLATFORM_WINDOWS
+/* 
+ * Windows-specific: Send TTY output buffer to client via IPC.
+ * Uses a dedicated stream (TTY_STREAM = 100) for attached client TTY output.
+ * Unlike file_print_buffer, this works for attached clients.
+ */
+#define WIN32_TTY_STREAM 100
+
+void
+win32_tty_write(struct client *c, void *data, size_t size)
+{
+	struct client_file	 find, *cf;
+	struct msg_write_open	 msg;
+
+	if (c == NULL || c->peer == NULL)
+		return;
+
+	win32_log("win32_tty_write: c=%p size=%zu\n", (void*)c, size);
+
+	/* Look for existing TTY stream file, or create one */
+	find.stream = WIN32_TTY_STREAM;
+	cf = RB_FIND(client_files, &c->files, &find);
+	if (cf == NULL) {
+		/* First time: create file and send MSG_WRITE_OPEN */
+		cf = file_create_with_client(c, WIN32_TTY_STREAM, NULL, NULL);
+		cf->path = xstrdup("-");
+
+		evbuffer_add(cf->buffer, data, size);
+
+		msg.stream = WIN32_TTY_STREAM;
+		msg.fd = STDOUT_FILENO;  /* Tell client to write to stdout */
+		msg.flags = 0;
+		
+		win32_log("win32_tty_write: sending MSG_WRITE_OPEN stream=%d fd=%d\n",
+			msg.stream, msg.fd);
+		proc_send(c->peer, MSG_WRITE_OPEN, -1, &msg, sizeof msg);
+	} else if (cf->closed) {
+		/* Stream was closed? Should not happen for TTY but handle it */
+		win32_log("win32_tty_write: ERROR stream already closed\n");
+	} else {
+		/* Stream already open: add data and push */
+		evbuffer_add(cf->buffer, data, size);
+		file_push(cf);
+	}
+}
+#endif
+
+
 /* Report an error to a file. */
+
 void
 file_error(struct client *c, const char *fmt, ...)
 {
@@ -493,7 +565,7 @@ file_push(struct client_file *cf)
 	if (left != 0) {
 		cf->references++;
 		event_once(-1, EV_TIMEOUT, file_push_cb, cf, NULL);
-	} else if (cf->stream > 2) {
+	} else if (cf->stream > 2 && cf->stream != WIN32_TTY_STREAM) {
 		close.stream = cf->stream;
 		proc_send(cf->peer, MSG_WRITE_CLOSE, -1, &close, sizeof close);
 		file_fire_done(cf);
@@ -592,6 +664,11 @@ file_write_open(struct client_files *files, struct tmuxpeer *peer,
 		goto reply;
 	}
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("file_write_open: stream=%d path=%s msg->fd=%d allow_streams=%d\n",
+		msg->stream, path, msg->fd, allow_streams);
+#endif
+
 	cf->fd = -1;
 	if (msg->fd == -1)
 		cf->fd = open(path, msg->flags|flags, 0644);
@@ -599,16 +676,45 @@ file_write_open(struct client_files *files, struct tmuxpeer *peer,
 		if (msg->fd != STDOUT_FILENO && msg->fd != STDERR_FILENO)
 			errno = EBADF;
 		else {
+#ifdef PLATFORM_WINDOWS
+			/* Windows: use _dup() for MSVCRT, with GetStdHandle fallback */
+			cf->fd = _dup(msg->fd);
+			if (cf->fd == -1) {
+				/* Fallback: get Windows handle and create fd */
+				DWORD std_handle = (msg->fd == STDOUT_FILENO) 
+					? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE;
+				HANDLE h = GetStdHandle(std_handle);
+				if (h != INVALID_HANDLE_VALUE && h != NULL) {
+					cf->fd = _open_osfhandle((intptr_t)h, _O_TEXT);
+				}
+			}
+			win32_log("file_write_open: Windows dup result cf->fd=%d errno=%d\n",
+				cf->fd, (cf->fd == -1 ? errno : 0));
+#else
 			cf->fd = dup(msg->fd);
 			if (close_received)
 				close(msg->fd); /* can only be used once */
+#endif
 		}
 	} else
 	      errno = EBADF;
 	if (cf->fd == -1) {
 		error = errno;
+#ifdef PLATFORM_WINDOWS
+		win32_log("file_write_open: FAILED cf->fd=-1 error=%d\n", error);
+#endif
 		goto reply;
 	}
+
+
+#ifdef PLATFORM_WINDOWS
+	/* Windows: STDOUT/STDERR handles are not selectable and cause spin in libevent. */
+	if (msg->fd == STDOUT_FILENO || msg->fd == STDERR_FILENO) {
+		cf->event = NULL;
+		win32_log("file_write_open: skipping bufferevent for stdout/stderr (fd=%d)\n", cf->fd);
+		goto reply;
+	}
+#endif
 
 	cf->event = bufferevent_new(cf->fd, NULL, file_write_callback,
 	    file_write_error_callback, cf);
@@ -641,6 +747,46 @@ file_write_data(struct client_files *files, struct imsg *imsg)
 
 	if (cf->event != NULL)
 		bufferevent_write(cf->event, msg + 1, size);
+#ifdef PLATFORM_WINDOWS
+	else if (cf->fd != -1 && (cf->stream == 1 || cf->stream == 2 || cf->stream == 100)) {
+		/* Write directly to console handle to ensure VT sequences are processed */
+		DWORD std_handle = (cf->stream == 2) ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE;
+		HANDLE hConsole = GetStdHandle(std_handle);
+		if (hConsole != INVALID_HANDLE_VALUE && hConsole != NULL) {
+			DWORD mode = 0, written = 0;
+			GetConsoleMode(hConsole, &mode);
+			win32_log("file_write_data: stream=%d hConsole=%p mode=0x%lx size=%zu\n", 
+				cf->stream, (void*)hConsole, mode, size);
+			
+			/* Hex dump first 64 bytes to verify VT sequences */
+			if (size > 0) {
+				char hexbuf[200];
+				size_t dumplen = (size > 64) ? 64 : size;
+				const unsigned char *data = (const unsigned char*)(msg + 1);
+				char *p = hexbuf;
+				for (size_t i = 0; i < dumplen && (p - hexbuf) < 190; i++) {
+					if (data[i] == 0x1b) {
+						p += sprintf(p, "[ESC]");
+					} else if (data[i] < 32) {
+						p += sprintf(p, "[%02X]", data[i]);
+					} else {
+						*p++ = data[i];
+					}
+				}
+				*p = '\0';
+				win32_log("file_write_data: first bytes: %s\n", hexbuf);
+			}
+			
+			if (!WriteFile(hConsole, msg + 1, (DWORD)size, &written, NULL)) {
+				win32_log("file_write_data: WriteFile failed, error=%lu\n", GetLastError());
+			}
+		} else {
+			/* Fallback to win32_write if console handle unavailable */
+			win32_log("file_write_data: no console handle, using win32_write\n");
+			win32_write(cf->fd, msg + 1, size);
+		}
+	}
+#endif
 }
 
 /* Handle a file write close message (client). */

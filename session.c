@@ -148,6 +148,9 @@ session_create(const char *prefix, const char *name, const char *cwd,
 	}
 	RB_INSERT(sessions, &sessions, s);
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("session_create: new session %s $%u\n", s->name, s->id);
+#endif
 	log_debug("new session %s $%u", s->name, s->id);
 
 	if (gettimeofday(&s->creation_time, NULL) != 0)

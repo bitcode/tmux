@@ -385,18 +385,31 @@ status_redraw(struct client *c)
 	struct format_tree		*ft;
 	char				*expanded;
 
-	log_debug("%s enter", __func__);
+#ifdef PLATFORM_WINDOWS
+	win32_log("status_redraw: ENTRY c=%p session=%p sx=%u sy=%u\n",
+		(void*)c, (void*)s, c->tty.sx, c->tty.sy);
+#endif
 
 	/* Shouldn't get here if not the active screen. */
-	if (sl->active != &sl->screen)
+	if (sl->active != &sl->screen) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("status_redraw: sl->active != &sl->screen\n");
+#endif
 		fatalx("not the active screen");
+	}
 
 	/* No status line? */
 	lines = status_line_size(c);
+#ifdef PLATFORM_WINDOWS
+	win32_log("status_redraw: lines=%u\n", lines);
+#endif
 	if (c->tty.sy == 0 || lines == 0)
 		return (1);
 
 	/* Create format tree. */
+#ifdef PLATFORM_WINDOWS
+	win32_log("status_redraw: creating format tree\n");
+#endif
 	flags = FORMAT_STATUS;
 	if (c->flags & CLIENT_STATUSFORCE)
 		flags |= FORMAT_FORCE;
@@ -404,6 +417,9 @@ status_redraw(struct client *c)
 	format_defaults(ft, c, NULL, NULL, NULL);
 
 	/* Set up default colour. */
+#ifdef PLATFORM_WINDOWS
+	win32_log("status_redraw: applying style\n");
+#endif
 	style_apply(&gc, s->options, "status-style", ft);
 	fg = options_get_number(s->options, "status-fg");
 	if (!COLOUR_DEFAULT(fg))
@@ -417,43 +433,77 @@ status_redraw(struct client *c)
 	}
 
 	/* Resize the target screen. */
+#ifdef PLATFORM_WINDOWS
+	win32_log("status_redraw: resizing screen width=%u lines=%u\n", width, lines);
+#endif
 	if (screen_size_x(&sl->screen) != width ||
 	    screen_size_y(&sl->screen) != lines) {
 		screen_resize(&sl->screen, width, lines, 0);
 		changed = force = 1;
 	}
+
+#ifdef PLATFORM_WINDOWS
+	win32_log("status_redraw: starting screen write\n");
+#endif
 	screen_write_start(&ctx, &sl->screen);
 
 	/* Write the status lines. */
 	o = options_get(s->options, "status-format");
 	if (o == NULL) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("status_redraw: o == NULL, clearing lines\n");
+#endif
 		for (n = 0; n < width * lines; n++)
 			screen_write_putc(&ctx, &gc, ' ');
 	} else {
+#ifdef PLATFORM_WINDOWS
+		win32_log("status_redraw: processing status-format lines=%u\n", lines);
+#endif
 		for (i = 0; i < lines; i++) {
+#ifdef PLATFORM_WINDOWS
+			win32_log("status_redraw: processing line %u\n", i);
+#endif
 			screen_write_cursormove(&ctx, 0, i, 0);
 
 			ov = options_array_get(o, i);
 			if (ov == NULL) {
+#ifdef PLATFORM_WINDOWS
+				win32_log("status_redraw: line %u ov == NULL\n", i);
+#endif
 				for (n = 0; n < width; n++)
 					screen_write_putc(&ctx, &gc, ' ');
 				continue;
 			}
 			sle = &sl->entries[i];
 
+#ifdef PLATFORM_WINDOWS
+			win32_log("status_redraw: expanding line %u format=%s\n", i, ov->string);
+#endif
 			expanded = format_expand_time(ft, ov->string);
+#ifdef PLATFORM_WINDOWS
+			win32_log("status_redraw: expanded line %u=%s\n", i, expanded);
+#endif
 			if (!force &&
 			    sle->expanded != NULL &&
 			    strcmp(expanded, sle->expanded) == 0) {
+#ifdef PLATFORM_WINDOWS
+				win32_log("status_redraw: line %u unchanged\n", i);
+#endif
 				free(expanded);
 				continue;
 			}
 			changed = 1;
 
+#ifdef PLATFORM_WINDOWS
+			win32_log("status_redraw: writing line %u\n", i);
+#endif
 			for (n = 0; n < width; n++)
 				screen_write_putc(&ctx, &gc, ' ');
 			screen_write_cursormove(&ctx, 0, i, 0);
 
+#ifdef PLATFORM_WINDOWS
+			win32_log("status_redraw: drawing format line %u\n", i);
+#endif
 			status_free_ranges(&sle->ranges);
 			format_draw(&ctx, &gc, width, expanded, &sle->ranges,
 			    0);
@@ -462,6 +512,9 @@ status_redraw(struct client *c)
 			sle->expanded = expanded;
 		}
 	}
+#ifdef PLATFORM_WINDOWS
+	win32_log("status_redraw: stopping screen write\n");
+#endif
 	screen_write_stop(&ctx);
 
 	/* Free the format tree. */
@@ -469,8 +522,12 @@ status_redraw(struct client *c)
 
 	/* Return if the status line has changed. */
 	log_debug("%s exit: force=%d, changed=%d", __func__, force, changed);
+#ifdef PLATFORM_WINDOWS
+	win32_log("status_redraw: EXIT force=%d changed=%d\n", force, changed);
+#endif
 	return (force || changed);
 }
+
 
 /* Set a status line message. */
 void

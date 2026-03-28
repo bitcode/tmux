@@ -16,6 +16,8 @@
  * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include "tmux.h"
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -30,7 +32,9 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "tmux.h"
+#ifdef PLATFORM_WINDOWS
+#include <process.h>
+#endif
 
 static struct tmuxproc	*client_proc;
 static struct tmuxpeer	*client_peer;
@@ -58,6 +62,66 @@ static int		 client_attached;
 static struct client_files client_files = RB_INITIALIZER(&client_files);
 
 static __dead void	 client_exec(const char *,const char *);
+
+#ifdef PLATFORM_WINDOWS
+unsigned int __stdcall
+client_input_thread(void *arg)
+{
+	int	fd = (intptr_t)arg;
+	HANDLE	hIn = GetStdHandle(STD_INPUT_HANDLE);
+	char	buf[1024];
+	DWORD	nread;
+
+	win32_log("client_input_thread: started with fd=%d, hIn=%p\n", fd, hIn);
+
+	while (1) {
+		if (!ReadFile(hIn, buf, sizeof buf, &nread, NULL)) {
+			DWORD err = GetLastError();
+			win32_log("client_input_thread: ReadFile failed, error=%lu\n", err);
+			break;
+		}
+		if (nread == 0) {
+			win32_log("client_input_thread: ReadFile returned 0 bytes (EOF)\n");
+			break;
+		}
+		win32_log("client_input_thread: read %lu bytes, writing to fd=%d\n", nread, fd);
+		ssize_t written = write(fd, buf, nread);
+		if (written == -1) {
+			win32_log("client_input_thread: write failed, errno=%d\n", errno);
+			break;
+		}
+		win32_log("client_input_thread: wrote %zd bytes to fd=%d\n", written, fd);
+	}
+	win32_log("client_input_thread: thread exiting\n");
+	return (0);
+}
+
+
+static void
+client_input_callback(__unused int fd_ignore, __unused short events, void *arg)
+{
+	/* 
+	 * NOTE: libevent passes the raw SOCKET handle as fd_ignore, but we need 
+	 * the mapped fd that we stored in arg to use with win32_read().
+	 */
+	int	mapped_fd = (int)(intptr_t)arg;
+	char	buf[1024];
+	ssize_t	n;
+
+	win32_log("client_input_callback: reading from mapped_fd=%d (raw fd was %d)\n", mapped_fd, fd_ignore);
+	n = read(mapped_fd, buf, sizeof buf);
+	win32_log("client_input_callback: read returned %zd\n", n);
+	if (n > 0) {
+		win32_log("client_input_callback: sending MSG_TTY_INPUT with %zd bytes\n", n);
+		proc_send(client_peer, MSG_TTY_INPUT, -1, buf, n);
+		proc_flush_peer(client_peer);
+	} else if (n == 0) {
+		win32_log("client_input_callback: EOF on input socket\n");
+	} else {
+		win32_log("client_input_callback: read error, errno=%d\n", errno);
+	}
+}
+#endif
 static int		 client_get_lock(char *);
 static int		 client_connect(struct event_base *, const char *,
 			     uint64_t);
@@ -106,8 +170,12 @@ client_connect(struct event_base *base, const char *path, uint64_t flags)
 {
 	struct sockaddr_un	sa;
 	size_t			size;
-	int			fd, lockfd = -1, locked = 0;
+	int			fd = -1, lockfd = -1, locked = 0;
 	char		       *lockfile = NULL;
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: entered with path %s\n", path);
+#endif
 
 	memset(&sa, 0, sizeof sa);
 	sa.sun_family = AF_UNIX;
@@ -119,24 +187,74 @@ client_connect(struct event_base *base, const char *path, uint64_t flags)
 	log_debug("socket is %s", path);
 
 retry:
-	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: creating socket\n");
+#endif
+	fd = win32_socket(AF_UNIX, SOCK_STREAM, 0);
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: win32_socket returned fd=%d\n", fd);
+#endif
+	if (fd == -1) {
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: win32_socket failed\n");
+#endif
 		return (-1);
+    }
 
 	log_debug("trying connect");
-	if (connect(fd, (struct sockaddr *)&sa, sizeof sa) == -1) {
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: calling win32_connect\n");
+#endif
+	if (win32_connect(fd, (struct sockaddr *)&sa, sizeof sa) == -1) {
 		log_debug("connect failed: %s", strerror(errno));
-		if (errno != ECONNREFUSED && errno != ENOENT)
+		if (errno != ECONNREFUSED && errno != ENOENT) {
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: connect failed errno=%d\n", errno);
+#endif
+			close(fd);
+			return (-1);
+		}
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: connect REFUSED/NOENT, starting server\n");
+#endif
+		close(fd);
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: close(fd) done\n");
+#endif
+		fd = -1;
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: flags=%llu, CLIENT_STARTSERVER=%llu\n", (unsigned long long)flags, (unsigned long long)CLIENT_STARTSERVER);
+#endif
+
+		if (flags & CLIENT_NOSTARTSERVER) {
+#ifdef PLATFORM_WINDOWS
+            win32_log("client_connect: NOSTARTSERVER set, failing\n");
+#endif
 			goto failed;
-		if (flags & CLIENT_NOSTARTSERVER)
+        }
+		if (!(flags & CLIENT_STARTSERVER)) {
+#ifdef PLATFORM_WINDOWS
+            win32_log("client_connect: STARTSERVER NOT set, FORCING it on Windows\n");
+            flags |= CLIENT_STARTSERVER;
+#else
 			goto failed;
-		if (~flags & CLIENT_STARTSERVER)
-			goto failed;
+#endif
+        }
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: proceeding to lock logic\n");
+#endif
 		close(fd);
 
 		if (!locked) {
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: attempting lock\n");
+#endif
 			xasprintf(&lockfile, "%s.lock", path);
 			if ((lockfd = client_get_lock(lockfile)) < 0) {
 				log_debug("didn't get lock (%d)", lockfd);
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: lock failed %d\n", lockfd);
+#endif
 
 				free(lockfile);
 				lockfile = NULL;
@@ -145,6 +263,9 @@ retry:
 					goto retry;
 			}
 			log_debug("got lock (%d)", lockfd);
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: got lock %d\n", lockfd);
+#endif
 
 			/*
 			 * Always retry at least once, even if we got the lock,
@@ -161,14 +282,36 @@ retry:
 			close(lockfd);
 			return (-1);
 		}
-		fd = server_start(client_proc, flags, base, lockfd, lockfile);
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: calling server_start with lockfd=%d, lockfile=%s\n", lockfd, lockfile ? lockfile : "NULL");
+#endif
+	if (server_start(client_proc, flags, base, lockfd, lockfile) != 0) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("client_connect: server_start failed\n");
+#endif
+        goto failed;
+    }
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: server_start success, retrying connect\n");
+    Sleep(200); // Give server a moment to bind
+#endif
+    goto retry;
 	}
 
 	if (locked && lockfd >= 0) {
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: freeing lockfile and closing lockfd=%d\n", lockfd);
+#endif
 		free(lockfile);
 		close(lockfd);
 	}
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: calling setblocking(%d, 0)\n", fd);
+#endif
 	setblocking(fd, 0);
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_connect: returning fd=%d\n", fd);
+#endif
 	return (fd);
 
 failed:
@@ -245,6 +388,10 @@ client_main(struct event_base *base, int argc, char **argv, uint64_t flags,
 	u_int			 ncaps = 0;
 	struct args_value	*values;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_main: entered\n");
+#endif
+
 	/* Set up the initial command. */
 	if (shell_command != NULL) {
 		msg = MSG_SHELL;
@@ -253,6 +400,9 @@ client_main(struct event_base *base, int argc, char **argv, uint64_t flags,
 		msg = MSG_COMMAND;
 		flags |= CLIENT_STARTSERVER;
 	} else {
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_main: parsing args, argc=%d\n", argc);
+#endif
 		msg = MSG_COMMAND;
 
 		/*
@@ -270,15 +420,28 @@ client_main(struct event_base *base, int argc, char **argv, uint64_t flags,
 			free(pr->error);
 		args_free_values(values, argc);
 		free(values);
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_main: args parsed\n");
+#endif
 	}
 
 	/* Create client process structure (starts logging). */
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_main: calling proc_start\n");
+#endif
 	client_proc = proc_start("client");
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_main: proc_start done\n");
+#endif
 	proc_set_signals(client_proc, client_signal);
 
 	/* Save the flags. */
 	client_flags = flags;
 	log_debug("flags are %#llx", (unsigned long long)client_flags);
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_main: flags saved, connecting\n");
+#endif
 
 	/* Initialize the client socket and start the server. */
 #ifdef HAVE_SYSTEMD
@@ -288,7 +451,13 @@ client_main(struct event_base *base, int argc, char **argv, uint64_t flags,
 	} else
 #endif
 	fd = client_connect(base, socket_path, client_flags);
+#ifdef PLATFORM_WINDOWS
+    win32_log("client_main: client_connect returned %d, errno=%d\n", fd, errno);
+#endif
 	if (fd == -1) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("client_main: connect failed\n");
+#endif
 		if (errno == ECONNREFUSED) {
 			fprintf(stderr, "no server running on %s\n",
 			    socket_path);
@@ -298,7 +467,13 @@ client_main(struct event_base *base, int argc, char **argv, uint64_t flags,
 		}
 		return (1);
 	}
+#ifdef PLATFORM_WINDOWS
+	win32_log("client_main: calling proc_add_peer for fd=%d\n", fd);
+#endif
 	client_peer = proc_add_peer(client_proc, fd, client_dispatch, NULL);
+#ifdef PLATFORM_WINDOWS
+	win32_log("client_main: proc_add_peer returned %p\n", client_peer);
+#endif
 
 	/* Save these before pledge(). */
 	if ((cwd = find_cwd()) == NULL && (cwd = find_home()) == NULL)
@@ -307,6 +482,10 @@ client_main(struct event_base *base, int argc, char **argv, uint64_t flags,
 		ttynam = "";
 	if ((termname = getenv("TERM")) == NULL)
 		termname = "";
+
+#ifdef PLATFORM_WINDOWS
+	win32_log("client_main: cwd=%s, ttynam=%s, termname=%s\n", cwd, ttynam, termname);
+#endif
 
 	/*
 	 * Drop privileges for client. "proc exec" is needed for -c and for
@@ -323,13 +502,39 @@ client_main(struct event_base *base, int argc, char **argv, uint64_t flags,
 		fatal("pledge failed");
 
 	/* Load terminfo entry if any. */
-	if (isatty(STDIN_FILENO) &&
-	    *termname != '\0' &&
-	    tty_term_read_list(termname, STDIN_FILENO, &caps, &ncaps,
-	    &cause) != 0) {
-		fprintf(stderr, "%s\n", cause);
-		free(cause);
-		return (1);
+	if (isatty(STDIN_FILENO)) {
+		if (termname == NULL || *termname == '\0')
+#ifdef PLATFORM_WINDOWS
+			termname = "xterm-256color";  /* Windows Terminal supports full xterm */
+#else
+			termname = "screen";
+#endif
+
+
+#ifdef PLATFORM_WINDOWS
+		win32_log("client_main: termname=%s\n", termname);
+#endif
+
+#ifdef PLATFORM_WINDOWS
+		if (ncaps == 0) {
+			win32_log("client_main: ncaps=0, injecting fallbacks\n");
+			/* Inject mandatory capabilities for modern ANSI terminals */
+			caps = xreallocarray(NULL, 11, sizeof *caps);
+			ncaps = 0;
+			xasprintf(&caps[ncaps++], "clear=\033[H\033[2J");
+			xasprintf(&caps[ncaps++], "cup=\033[%%i%%p1%%d;%%p2%%dH");
+			xasprintf(&caps[ncaps++], "bel=\007");
+			xasprintf(&caps[ncaps++], "cols=80");
+			xasprintf(&caps[ncaps++], "lines=24");
+			xasprintf(&caps[ncaps++], "am=1");
+			xasprintf(&caps[ncaps++], "sgr0=\033[m");
+			xasprintf(&caps[ncaps++], "bold=\033[1m");
+			xasprintf(&caps[ncaps++], "colors=256");
+			xasprintf(&caps[ncaps++], "AX=1");
+			xasprintf(&caps[ncaps++], "XT=1");
+		}
+		win32_log("client_main: tty_term_read_list success, ncaps=%u\n", ncaps);
+#endif
 	}
 
 	/* Free stuff that is not used in the client. */
@@ -457,9 +662,54 @@ client_send_identify(const char *ttynam, const char *termname, char **caps,
 	pid_t	  pid;
 	u_int	  i;
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("client_send_identify: starting identification\n");
+#endif
 	proc_send(client_peer, MSG_IDENTIFY_LONGFLAGS, -1, &flags, sizeof flags);
+#ifdef PLATFORM_WINDOWS
+	/* 
+	 * Configure console for tmux operation:
+	 * - Output: Enable VT processing so escape sequences are rendered
+	 * - Input: Disable line mode/echo (raw mode), enable VT sequences
+	 */
+	HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+	HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+	DWORD dwMode = 0;
+	
+	/* Configure stdout for VT processing */
+	if (GetConsoleMode(hOut, &dwMode)) {
+		dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+		/* Note: NOT setting DISABLE_NEWLINE_AUTO_RETURN - tmux uses absolute cursor positioning */
+		if (!SetConsoleMode(hOut, dwMode)) {
+			win32_log("client_send_identify: SetConsoleMode(STDOUT, VT) failed, error=%lu\n", GetLastError());
+		} else {
+			win32_log("client_send_identify: STDOUT VT enabled, hOut=%p mode=0x%lx\n", (void*)hOut, dwMode);
+		}
+	}
+	
+	/* Configure stdin for raw VT input mode (no echo, no line buffering) */
+	if (GetConsoleMode(hIn, &dwMode)) {
+		DWORD oldMode = dwMode;
+		/* Clear line input mode and echo - we want raw keystrokes */
+		dwMode &= ~ENABLE_LINE_INPUT;        /* Don't wait for Enter */
+		dwMode &= ~ENABLE_ECHO_INPUT;        /* Don't echo chars locally */
+		dwMode &= ~ENABLE_PROCESSED_INPUT;   /* Don't interpret Ctrl+C locally */
+		/* Enable VT sequences for special keys (arrows, function keys) */
+		dwMode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+		/* Keep window input for resize events */
+		dwMode |= ENABLE_WINDOW_INPUT;
+		
+		if (!SetConsoleMode(hIn, dwMode)) {
+			win32_log("client_send_identify: SetConsoleMode(STDIN, raw) failed, error=%lu\n", GetLastError());
+		} else {
+			win32_log("client_send_identify: STDIN raw mode enabled, old=0x%lx new=0x%lx\n", oldMode, dwMode);
+		}
+	}
+#endif
+
+
 	proc_send(client_peer, MSG_IDENTIFY_LONGFLAGS, -1, &client_flags,
-	    sizeof client_flags);
+		sizeof client_flags);
 
 	proc_send(client_peer, MSG_IDENTIFY_TERM, -1, termname,
 	    strlen(termname) + 1);
@@ -474,12 +724,42 @@ client_send_identify(const char *ttynam, const char *termname, char **caps,
 		    caps[i], strlen(caps[i]) + 1);
 	}
 
+#ifdef PLATFORM_WINDOWS
+	struct winsize ws;
+	CONSOLE_SCREEN_BUFFER_INFO csbi;
+
+	memset(&ws, 0, sizeof ws);
+	if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+		ws.ws_col = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+		ws.ws_row = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+		
+		/* Enforce minimum size to prevent rendering issues */
+		if (ws.ws_col < 80)
+			ws.ws_col = 80;
+		if (ws.ws_row < 24)
+			ws.ws_row = 24;
+			
+		win32_log("client_send_identify: reporting size %ux%u (raw: %dx%d)\n", 
+			ws.ws_col, ws.ws_row,
+			csbi.srWindow.Right - csbi.srWindow.Left + 1,
+			csbi.srWindow.Bottom - csbi.srWindow.Top + 1);
+	} else {
+		ws.ws_col = 80;
+		ws.ws_row = 24;
+		win32_log("client_send_identify: GetConsoleScreenBufferInfo failed, defaulting to 80x24\n");
+	}
+
+
+	proc_send(client_peer, MSG_IDENTIFY_STDIN, -1, NULL, 0);
+	proc_send(client_peer, MSG_IDENTIFY_STDOUT, -1, &ws, sizeof ws);
+#else
 	if ((fd = dup(STDIN_FILENO)) == -1)
 		fatal("dup failed");
 	proc_send(client_peer, MSG_IDENTIFY_STDIN, fd, NULL, 0);
 	if ((fd = dup(STDOUT_FILENO)) == -1)
 		fatal("dup failed");
 	proc_send(client_peer, MSG_IDENTIFY_STDOUT, fd, NULL, 0);
+#endif
 
 	pid = getpid();
 	proc_send(client_peer, MSG_IDENTIFY_CLIENTPID, -1, &pid, sizeof pid);
@@ -492,6 +772,9 @@ client_send_identify(const char *ttynam, const char *termname, char **caps,
 	}
 
 	proc_send(client_peer, MSG_IDENTIFY_DONE, -1, NULL, 0);
+#ifdef PLATFORM_WINDOWS
+	win32_log("client_send_identify: identification done\n");
+#endif
 }
 
 /* Run command in shell; used for -c. */
@@ -583,7 +866,15 @@ client_file_check_cb(__unused struct client *c, __unused const char *path,
 static void
 client_dispatch(struct imsg *imsg, __unused void *arg)
 {
+#ifdef PLATFORM_WINDOWS
+	win32_log("client_dispatch: imsg=%p client_exitflag=%d\n", 
+		(void*)imsg, client_exitflag);
+#endif
+
 	if (imsg == NULL) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("client_dispatch: imsg=NULL, setting CLIENT_EXIT_LOST_SERVER, exitval=1\n");
+#endif
 		if (!client_exitflag) {
 			client_exitreason = CLIENT_EXIT_LOST_SERVER;
 			client_exitval = 1;
@@ -592,11 +883,17 @@ client_dispatch(struct imsg *imsg, __unused void *arg)
 		return;
 	}
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("client_dispatch: imsg->hdr.type=%d client_attached=%d\n", 
+		imsg->hdr.type, client_attached);
+#endif
+
 	if (client_attached)
 		client_dispatch_attached(imsg);
 	else
 		client_dispatch_wait(imsg);
 }
+
 
 /* Process an exit message. */
 static void
@@ -661,6 +958,19 @@ client_dispatch_wait(struct imsg *imsg)
 			fatalx("bad MSG_READY size");
 
 		client_attached = 1;
+#ifdef PLATFORM_WINDOWS
+		{
+			int input_fds[2];
+			if (win32_socketpair(AF_INET, SOCK_STREAM, 0, input_fds) == 0) {
+				win32_log("client_dispatch_attached: input_fds[0]=%d, input_fds[1]=%d\n", input_fds[0], input_fds[1]);
+				_beginthreadex(NULL, 0, client_input_thread, (void*)(intptr_t)input_fds[1], 0, NULL);
+				struct event *ev = xmalloc(sizeof *ev);
+				/* Pass input_fds[0] as arg so callback can use mapped fd, not raw SOCKET */
+				win32_event_set(ev, input_fds[0], EV_READ | EV_PERSIST, client_input_callback, (void*)(intptr_t)input_fds[0]);
+				event_add(ev, NULL);
+			}
+		}
+#endif
 		proc_send(client_peer, MSG_RESIZE, -1, NULL, 0);
 		break;
 	case MSG_VERSION:
@@ -804,6 +1114,25 @@ client_dispatch_attached(struct imsg *imsg)
 
 		system(data);
 		proc_send(client_peer, MSG_UNLOCK, -1, NULL, 0);
+		break;
+	case MSG_READ_OPEN:
+		file_read_open(&client_files, client_peer, imsg, 1,
+		    !(client_flags & CLIENT_CONTROL), client_file_check_cb,
+		    NULL);
+		break;
+	case MSG_READ_CANCEL:
+		file_read_cancel(&client_files, imsg);
+		break;
+	case MSG_WRITE_OPEN:
+		file_write_open(&client_files, client_peer, imsg, 1,
+		    !(client_flags & CLIENT_CONTROL), client_file_check_cb,
+		    NULL);
+		break;
+	case MSG_WRITE:
+		file_write_data(&client_files, imsg);
+		break;
+	case MSG_WRITE_CLOSE:
+		file_write_close(&client_files, imsg);
 		break;
 	}
 }

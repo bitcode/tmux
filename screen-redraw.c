@@ -579,12 +579,31 @@ screen_redraw_update(struct screen_redraw_ctx *ctx, uint64_t flags)
 	int				 redraw;
 	enum pane_lines			 lines;
 
-	if (c->message_string != NULL)
+#ifdef PLATFORM_WINDOWS
+	win32_log("screen_redraw_update: ENTRY c=%p flags=%#llx\n", (void*)c, flags);
+#endif
+
+	if (c->message_string != NULL) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("screen_redraw_update: calling status_message_redraw\n");
+#endif
 		redraw = status_message_redraw(c);
-	else if (c->prompt_string != NULL)
+	} else if (c->prompt_string != NULL) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("screen_redraw_update: calling status_prompt_redraw\n");
+#endif
 		redraw = status_prompt_redraw(c);
-	else
+	} else {
+#ifdef PLATFORM_WINDOWS
+		win32_log("screen_redraw_update: calling status_redraw\n");
+#endif
 		redraw = status_redraw(c);
+	}
+
+#ifdef PLATFORM_WINDOWS
+	win32_log("screen_redraw_update: redraw=%d\n", redraw);
+#endif
+
 	if (!redraw && (~flags & CLIENT_REDRAWSTATUSALWAYS))
 		flags &= ~CLIENT_REDRAWSTATUS;
 
@@ -592,6 +611,9 @@ screen_redraw_update(struct screen_redraw_ctx *ctx, uint64_t flags)
 		flags |= CLIENT_REDRAWOVERLAY;
 
 	if (ctx->pane_status != PANE_STATUS_OFF) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("screen_redraw_update: checking pane status redraw\n");
+#endif
 		lines = ctx->pane_lines;
 		redraw = 0;
 		TAILQ_FOREACH(wp, &w->panes, entry) {
@@ -602,8 +624,12 @@ screen_redraw_update(struct screen_redraw_ctx *ctx, uint64_t flags)
 			flags |= CLIENT_REDRAWBORDERS;
 	}
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("screen_redraw_update: EXIT flags=%#llx\n", flags);
+#endif
 	return (flags);
 }
+
 
 /* Set up redraw context. */
 static void
@@ -646,42 +672,85 @@ screen_redraw_screen(struct client *c)
 	struct screen_redraw_ctx	ctx;
 	uint64_t			flags;
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("screen_redraw_screen: ENTRY c=%p\n", (void*)c);
+#endif
+
 	if (c->flags & CLIENT_SUSPENDED)
 		return;
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("screen_redraw_screen: setting context\n");
+#endif
 	screen_redraw_set_context(c, &ctx);
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("screen_redraw_screen: updating context\n");
+#endif
 	flags = screen_redraw_update(&ctx, c->flags);
-	if ((flags & CLIENT_ALLREDRAWFLAGS) == 0)
+	if ((flags & CLIENT_ALLREDRAWFLAGS) == 0) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("screen_redraw_screen: no redraw needed, EXIT\n");
+#endif
 		return;
+	}
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("screen_redraw_screen: synchronizing tty\n");
+#endif
 	tty_sync_start(&c->tty);
 	tty_update_mode(&c->tty, c->tty.mode, NULL);
 
 	if (flags & (CLIENT_REDRAWWINDOW|CLIENT_REDRAWBORDERS)) {
 		log_debug("%s: redrawing borders", c->name);
+#ifdef PLATFORM_WINDOWS
+		win32_log("screen_redraw_screen: drawing borders\n");
+#endif
 		screen_redraw_draw_borders(&ctx);
-		if (ctx.pane_status != PANE_STATUS_OFF)
+		if (ctx.pane_status != PANE_STATUS_OFF) {
+#ifdef PLATFORM_WINDOWS
+			win32_log("screen_redraw_screen: drawing pane status\n");
+#endif
 			screen_redraw_draw_pane_status(&ctx);
+		}
+#ifdef PLATFORM_WINDOWS
+		win32_log("screen_redraw_screen: drawing pane scrollbars\n");
+#endif
 		screen_redraw_draw_pane_scrollbars(&ctx);
 	}
 	if (flags & CLIENT_REDRAWWINDOW) {
 		log_debug("%s: redrawing panes", c->name);
+#ifdef PLATFORM_WINDOWS
+		win32_log("screen_redraw_screen: drawing panes\n");
+#endif
 		screen_redraw_draw_panes(&ctx);
+#ifdef PLATFORM_WINDOWS
+		win32_log("screen_redraw_screen: drawing pane scrollbars (again)\n");
+#endif
 		screen_redraw_draw_pane_scrollbars(&ctx);
 	}
 	if (ctx.statuslines != 0 &&
 	    (flags & (CLIENT_REDRAWSTATUS|CLIENT_REDRAWSTATUSALWAYS))) {
 		log_debug("%s: redrawing status", c->name);
+#ifdef PLATFORM_WINDOWS
+		win32_log("screen_redraw_screen: drawing status\n");
+#endif
 		screen_redraw_draw_status(&ctx);
 	}
 	if (c->overlay_draw != NULL && (flags & CLIENT_REDRAWOVERLAY)) {
 		log_debug("%s: redrawing overlay", c->name);
+#ifdef PLATFORM_WINDOWS
+		win32_log("screen_redraw_screen: drawing overlay\n");
+#endif
 		c->overlay_draw(c, c->overlay_data, &ctx);
 	}
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("screen_redraw_screen: resetting tty, EXIT\n");
+#endif
 	tty_reset(&c->tty);
 }
+
 
 /* Redraw a single pane and its scrollbar. */
 void
@@ -690,20 +759,36 @@ screen_redraw_pane(struct client *c, struct window_pane *wp,
 {
 	struct screen_redraw_ctx	ctx;
 
-	if (!window_pane_visible(wp))
+#ifdef PLATFORM_WINDOWS
+	win32_log("screen_redraw_pane: ENTRY c=%p wp=%p (id %u) redraw_scrollbar_only=%d\n",
+		(void*)c, (void*)wp, wp->id, redraw_scrollbar_only);
+#endif
+
+	if (!window_pane_visible(wp)) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("screen_redraw_pane: pane not visible, returning\n");
+#endif
 		return;
+	}
 
 	screen_redraw_set_context(c, &ctx);
 	tty_sync_start(&c->tty);
 	tty_update_mode(&c->tty, c->tty.mode, NULL);
 
-	if (!redraw_scrollbar_only)
+	if (!redraw_scrollbar_only) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("screen_redraw_pane: calling screen_redraw_draw_pane\n");
+#endif
 		screen_redraw_draw_pane(&ctx, wp);
+	}
 
 	if (window_pane_show_scrollbar(wp, ctx.pane_scrollbars))
 		screen_redraw_draw_pane_scrollbar(&ctx, wp);
 
 	tty_reset(&c->tty);
+#ifdef PLATFORM_WINDOWS
+	win32_log("screen_redraw_pane: EXIT\n");
+#endif
 }
 
 /* Get border cell style. */
@@ -913,6 +998,11 @@ screen_redraw_draw_pane(struct screen_redraw_ctx *ctx, struct window_pane *wp)
 		if (wp->yoff + j < ctx->oy || wp->yoff + j >= ctx->oy + ctx->sy)
 			continue;
 		y = top + wp->yoff + j - ctx->oy;
+
+#ifdef PLATFORM_WINDOWS
+		win32_log("screen_redraw_draw_pane: line %u y=%u\n", j, y);
+#endif
+
 
 		if (wp->xoff >= ctx->ox &&
 		    wp->xoff + wp->sx <= ctx->ox + ctx->sx) {

@@ -56,18 +56,35 @@ log_open(const char *name)
 {
 	char	*path;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("log_open: called with %s, level %d\n", name, log_level);
+#endif
 	if (log_level == 0)
 		return;
+#ifdef PLATFORM_WINDOWS
+    win32_log("log_open: calling log_close\n");
+#endif
 	log_close();
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("log_open: formatting path with pid %ld\n", (long)getpid());
+#endif
 	xasprintf(&path, "tmux-%s-%ld.log", name, (long)getpid());
+#ifdef PLATFORM_WINDOWS
+    win32_log("log_open: opening %s\n", path);
+#endif
 	log_file = fopen(path, "a");
 	free(path);
 	if (log_file == NULL)
 		return;
 
 	setvbuf(log_file, NULL, _IOLBF, 0);
+#ifndef PLATFORM_WINDOWS
 	event_set_log_callback(log_event_cb);
+#endif
+#ifdef PLATFORM_WINDOWS
+    win32_log("log_open: done\n");
+#endif
 }
 
 /* Toggle logging. */
@@ -145,6 +162,17 @@ fatal(const char *msg, ...)
 	if (snprintf(tmp, sizeof tmp, "fatal: %s: ", strerror(errno)) < 0)
 		exit(1);
 
+#ifdef PLATFORM_WINDOWS
+	{
+		va_list win_ap;
+		char win_buf[1024];
+		va_start(win_ap, msg);
+		vsnprintf(win_buf, sizeof(win_buf), msg, win_ap);
+		va_end(win_ap);
+		win32_log("FATAL: %s %s\n", tmp, win_buf);
+	}
+#endif
+
 	va_start(ap, msg);
 	log_vwrite(msg, ap, tmp);
 	va_end(ap);
@@ -158,9 +186,21 @@ fatalx(const char *msg, ...)
 {
 	va_list	 ap;
 
+#ifdef PLATFORM_WINDOWS
+	{
+		va_list win_ap;
+		char win_buf[1024];
+		va_start(win_ap, msg);
+		vsnprintf(win_buf, sizeof(win_buf), msg, win_ap);
+		va_end(win_ap);
+		win32_log("FATALX: %s\n", win_buf);
+	}
+#endif
+
 	va_start(ap, msg);
 	log_vwrite(msg, ap, "fatal: ");
 	va_end(ap);
 
 	exit(1);
 }
+

@@ -70,7 +70,7 @@ struct format_job {
 
 /* Format job tree. */
 static int format_job_cmp(struct format_job *, struct format_job *);
-static RB_HEAD(format_job_tree, format_job) format_jobs = RB_INITIALIZER();
+static RB_HEAD(format_job_tree, format_job) format_jobs = RB_INITIALIZER(format_jobs);
 RB_GENERATE_STATIC(format_job_tree, format_job, entry, format_job_cmp);
 
 /* Format job tree comparison function. */
@@ -3888,10 +3888,12 @@ format_find(struct format_tree *ft, const char *key, int modifiers,
 	struct environ_entry		*envent;
 	struct options_entry		*o;
 	int				 idx;
-	char				*found = NULL, *saved, s[512];
+	char				*found = NULL, *saved, s[512] = { 0 };
 	const char			*errstr;
 	time_t				 t = 0;
 	struct tm			 tm;
+
+	memset(&tm, 0, sizeof tm);
 
 	o = options_parse_get(global_options, key, &idx, 0);
 	if (o == NULL && ft->wp != NULL)
@@ -3958,15 +3960,21 @@ found:
 		}
 		if (t == 0)
 			return (NULL);
-		if (modifiers & FORMAT_PRETTY)
+		if (modifiers & FORMAT_PRETTY) {
 			found = format_pretty_time(t, 0);
-		else {
+		} else {
 			if (time_format != NULL) {
-				localtime_r(&t, &tm);
-				strftime(s, sizeof s, time_format, &tm);
+				if (localtime_r(&t, &tm) != NULL)
+					strftime(s, sizeof s, time_format, &tm);
+				else
+					xsnprintf(s, sizeof s, "<invalid time>");
 			} else {
-				ctime_r(&t, s);
-				s[strcspn(s, "\n")] = '\0';
+				if (localtime_r(&t, &tm) != NULL) {
+					xsnprintf(s, sizeof s, "%04d-%02d-%02d %02d:%02d:%02d",
+						tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+						tm.tm_hour, tm.tm_min, tm.tm_sec);
+				} else
+					xsnprintf(s, sizeof s, "<invalid time>");
 			}
 			found = xstrdup(s);
 		}
@@ -4977,8 +4985,14 @@ format_replace(struct format_expand_state *es, const char *key, size_t keylen,
 	u_int				  i, count, nsub = 0, nrep;
 	struct format_expand_state	  next;
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("format_replace: ENTRY depth=%u key=%.100s%s\n",
+		es->loop, key, keylen > 100 ? "..." : "");
+#endif
+
 	/* Make a copy of the key. */
 	copy = copy0 = xstrndup(key, keylen);
+
 
 	/* Process modifier list. */
 	list = format_build_modifiers(es, &copy, &count);
@@ -5505,6 +5519,9 @@ done:
 
 fail:
 	format_log(es, "failed %s", copy0);
+#ifdef PLATFORM_WINDOWS
+	win32_log("format_replace: FAILED depth=%u key=%s\n", es->loop, copy0);
+#endif
 
 	free(sub);
 	format_free_modifiers(list, count);
@@ -5512,6 +5529,9 @@ fail:
 	free(time_format);
 	return (-1);
 }
+
+
+
 
 /* Expand keys in a template. */
 static char *
@@ -5524,11 +5544,23 @@ format_expand1(struct format_expand_state *es, const char *fmt)
 	int			 ch, brackets;
 	char			 expanded[8192];
 
-	if (fmt == NULL || *fmt == '\0')
+#ifdef PLATFORM_WINDOWS
+	win32_log("format_expand1: ENTRY depth=%u fmt=%.100s%s\n", 
+		es->loop, fmt, strlen(fmt) > 100 ? "..." : "");
+#endif
+
+	if (fmt == NULL || *fmt == '\0') {
+#ifdef PLATFORM_WINDOWS
+		win32_log("format_expand1: empty fmt, EXIT\n");
+#endif
 		return (xstrdup(""));
+	}
 
 	if (es->loop == FORMAT_LOOP_LIMIT) {
 		format_log(es, "reached loop limit (%u)", FORMAT_LOOP_LIMIT);
+#ifdef PLATFORM_WINDOWS
+		win32_log("format_expand1: LOOP LIMIT REACHED, EXIT\n");
+#endif
 		return (xstrdup(""));
 	}
 	es->loop++;
@@ -5536,18 +5568,45 @@ format_expand1(struct format_expand_state *es, const char *fmt)
 	format_log(es, "expanding format: %s", fmt);
 
 	if ((es->flags & FORMAT_EXPAND_TIME) && strchr(fmt, '%') != NULL) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("format_expand1: time expansion starting for fmt=%.100s\n", fmt);
+#endif
 		if (es->time == 0) {
+#ifdef PLATFORM_WINDOWS
+			win32_log("format_expand1: getting current time\n");
+#endif
 			es->time = time(NULL);
-			localtime_r(&es->time, &es->tm);
+#ifdef PLATFORM_WINDOWS
+			win32_log("format_expand1: time=%lld, calling localtime_r\n", (long long)es->time);
+#endif
+			if (localtime_r(&es->time, &es->tm) == NULL) {
+#ifdef PLATFORM_WINDOWS
+				win32_log("format_expand1: localtime_r failed, scrub tm\n");
+#endif
+				memset(&es->tm, 0, sizeof es->tm);
+				es->tm.tm_mday = 1;
+			}
 		}
+#ifdef PLATFORM_WINDOWS
+		win32_log("format_expand1: calling strftime with tm_mday=%d\n", es->tm.tm_mday);
+#endif
 		if (strftime(expanded, sizeof expanded, fmt, &es->tm) == 0) {
+#ifdef PLATFORM_WINDOWS
+			win32_log("format_expand1: strftime returned 0 (too long or error)\n");
+#endif
 			format_log(es, "format is too long");
 			return (xstrdup(""));
 		}
+#ifdef PLATFORM_WINDOWS
+		win32_log("format_expand1: strftime success, result=%.100s\n", expanded);
+#endif
 		if (format_logging(ft) && strcmp(expanded, fmt) != 0)
 			format_log(es, "after time expanded: %s", expanded);
 		fmt = expanded;
 	}
+
+
+
 
 	len = 64;
 	buf = xmalloc(len);
@@ -5611,10 +5670,15 @@ format_expand1(struct format_expand_state *es, const char *fmt)
 			n = ptr - fmt;
 
 			format_log(es, "found #{}: %.*s", (int)n, fmt);
-			if (format_replace(es, fmt, n, &buf, &len, &off) != 0)
+			if (format_replace(es, fmt, n, &buf, &len, &off) != 0) {
+#ifdef PLATFORM_WINDOWS
+				win32_log("format_expand1: format_replace failed for #{}\n");
+#endif
 				break;
+			}
 			fmt += n + 1;
 			continue;
+
 		case '[':
 		case '#':
 			/*
@@ -5668,8 +5732,12 @@ format_expand1(struct format_expand_state *es, const char *fmt)
 			}
 			n = strlen(s);
 			format_log(es, "found #%c: %s", ch, s);
-			if (format_replace(es, s, n, &buf, &len, &off) != 0)
+			if (format_replace(es, s, n, &buf, &len, &off) != 0) {
+#ifdef PLATFORM_WINDOWS
+				win32_log("format_expand1: format_replace failed for %c\n", ch);
+#endif
 				break;
+			}
 			continue;
 		}
 
@@ -5680,8 +5748,13 @@ format_expand1(struct format_expand_state *es, const char *fmt)
 	format_log(es, "result is: %s", buf);
 	es->loop--;
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("format_expand1: EXIT depth=%u result=%.100s%s\n",
+		es->loop, buf, strlen(buf) > 100 ? "..." : "");
+#endif
 	return (buf);
 }
+
 
 /* Expand keys in a template, passing through strftime first. */
 char *

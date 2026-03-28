@@ -86,6 +86,10 @@ cmd_new_session_exec(struct cmd *self, struct cmdq_item *item)
 	struct cmd_find_state    fs;
 	struct args_value	*av;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("cmd_new_session_exec: entry, client %p\n", c);
+#endif
+
 	if (cmd_get_entry(self) == &cmd_has_session_entry) {
 		/*
 		 * cmd_find_target() will fail if the session cannot be found,
@@ -194,12 +198,25 @@ cmd_new_session_exec(struct cmd *self, struct cmdq_item *item)
 
 	/* Open the terminal if necessary. */
 	if (!detached && !already_attached) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("cmd_new_session_exec: calling server_client_open\n");
+#endif
 		if (server_client_open(c, &cause) != 0) {
+#ifdef PLATFORM_WINDOWS
+            win32_log("cmd_new_session_exec: server_client_open failed: %s\n", cause);
+#endif
 			cmdq_error(item, "open terminal failed: %s", cause);
 			free(cause);
 			goto fail;
 		}
+#ifdef PLATFORM_WINDOWS
+        win32_log("cmd_new_session_exec: server_client_open returned successfully\n");
+#endif
 	}
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("cmd_new_session_exec: calling session_create, name=%s\n", newname ? newname : "default");
+#endif
 
 	/* Get default session size. */
 	if (args_has(args, 'x')) {
@@ -275,9 +292,15 @@ cmd_new_session_exec(struct cmd *self, struct cmdq_item *item)
 		environ_put(env, av->string, 0);
 		av = args_next_value(av);
 	}
+#ifdef PLATFORM_WINDOWS
+    win32_log("cmd_new_session_exec: creating session %s\n", newname ? newname : "default");
+#endif
 	s = session_create(prefix, newname, cwd, env, oo, tiop);
 
 	/* Spawn the initial window. */
+#ifdef PLATFORM_WINDOWS
+    win32_log("cmd_new_session_exec: spawning initial window\n");
+#endif
 	sc.item = item;
 	sc.s = s;
 	if (!detached)
@@ -292,11 +315,18 @@ cmd_new_session_exec(struct cmd *self, struct cmdq_item *item)
 	sc.flags = 0;
 
 	if (spawn_window(&sc, &cause) == NULL) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("cmd_new_session_exec: spawn_window failed: %s\n", cause);
+#endif
 		session_destroy(s, 0, __func__);
 		cmdq_error(item, "create window failed: %s", cause);
 		free(cause);
 		goto fail;
 	}
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("cmd_new_session_exec: window spawned, group=%s\n", group ? group : "none");
+#endif
 
 	/*
 	 * If a target session is given, this is to be part of a session group,
@@ -314,6 +344,9 @@ cmd_new_session_exec(struct cmd *self, struct cmdq_item *item)
 		session_group_synchronize_to(s);
 		session_select(s, RB_MIN(winlinks, &s->windows)->idx);
 	}
+#ifdef PLATFORM_WINDOWS
+    win32_log("cmd_new_session_exec: notifying session-created\n");
+#endif
 	notify_session("session-created", s);
 
 	/*
@@ -321,6 +354,9 @@ cmd_new_session_exec(struct cmd *self, struct cmdq_item *item)
 	 * taking this session and needs to get MSG_READY and stay around.
 	 */
 	if (!detached) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("cmd_new_session_exec: attaching client to session\n");
+#endif
 		if (args_has(args, 'f'))
 			server_client_set_flags(c, args_get(args, 'f'));
 		if (!already_attached) {
@@ -332,6 +368,10 @@ cmd_new_session_exec(struct cmd *self, struct cmdq_item *item)
 		if (~cmdq_get_flags(item) & CMDQ_STATE_REPEAT)
 			server_client_set_key_table(c, NULL);
 	}
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("cmd_new_session_exec: finishing up\n");
+#endif
 
 	/* Print if requested. */
 	if (args_has(args, 'P')) {

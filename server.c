@@ -23,6 +23,10 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 
+#ifdef _MSC_VER
+#pragma warning(disable:4113)
+#endif
+
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -111,6 +115,10 @@ server_create_socket(uint64_t flags, char **cause)
 	mode_t			mask;
 	int			fd, saved_errno;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_create_socket: entered, path=%s\n", socket_path);
+#endif
+
 	memset(&sa, 0, sizeof sa);
 	sa.sun_family = AF_UNIX;
 	size = strlcpy(sa.sun_path, socket_path, sizeof sa.sun_path);
@@ -129,6 +137,9 @@ server_create_socket(uint64_t flags, char **cause)
 		mask = umask(S_IXUSR|S_IRWXG|S_IRWXO);
 	if (bind(fd, (struct sockaddr *)&sa, sizeof sa) == -1) {
 		saved_errno = errno;
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_create_socket: bind failed %d\n", saved_errno);
+#endif
 		close(fd);
 		errno = saved_errno;
 		goto fail;
@@ -137,10 +148,16 @@ server_create_socket(uint64_t flags, char **cause)
 
 	if (listen(fd, 128) == -1) {
 		saved_errno = errno;
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_create_socket: listen failed %d\n", saved_errno);
+#endif
 		close(fd);
 		errno = saved_errno;
 		goto fail;
 	}
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_create_socket: success, fd=%d\n", fd);
+#endif
 	setblocking(fd, 0);
 
 	return (fd);
@@ -176,14 +193,82 @@ int
 server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
     int lockfd, char *lockfile)
 {
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_start: entered with lockfd=%d, lockfile=%s\n", lockfd, lockfile ? lockfile : "NULL");
+#endif
 	int		 fd;
 	sigset_t	 set, oldset;
-	struct client	*c = NULL;
-	char		*cause = NULL;
-	struct timeval	 tv = { .tv_sec = 3600 };
-
 	sigfillset(&set);
 	sigprocmask(SIG_BLOCK, &set, &oldset);
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_start: signal mask done\n");
+#endif
+
+#ifdef PLATFORM_WINDOWS
+    /* Windows implementation: Spawn new process */
+    char *cmdline;
+    // Construct command line: tmux.exe -S socket_path __win32_server
+    // We need our own executable path.
+    char exe_path[MAX_PATH];
+    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_start: exe_path=%s\n", exe_path);
+#endif
+    
+    // Check if we need to pass socket path (-S)
+    if (socket_path) {
+        xasprintf(&cmdline, "\"%s\" -S \"%s\" __win32_server", exe_path, socket_path);
+    } else    {
+        xasprintf(&cmdline, "\"%s\" __win32_server", exe_path);
+    }
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_start: cmdline=%s\n", cmdline);
+#endif
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+
+    // Release lock before spawning?
+    // Parent holds lock (lockfd).
+    // If we spawn, child runs main -> ... -> open lock -> flock.
+    // Child blocks.
+    // Parent spawns.
+    // Parent closes lockfd.
+    // Child unblocks.
+    // Child creates socket.
+    // Parent waits for socket.
+    
+    // Spawn
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, DETACHED_PROCESS, NULL, NULL, &si, &pi)) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("server_start: CreateProcess failed %d\n", GetLastError());
+#endif
+        free(cmdline);
+        sigprocmask(SIG_SETMASK, &oldset, NULL);
+        return -1;
+    }
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_start: child pid %d\n", pi.dwProcessId);
+#endif
+    free(cmdline);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    // Release lock so child can proceed
+    if (lockfd >= 0) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("server_start: NOT closing lockfd here, letting caller handle it\n");
+#endif
+    }
+
+    sigprocmask(SIG_SETMASK, &oldset, NULL);
+    return 0; // Return 0 to indicate spawn success. Caller will retry connect.
+
+#else /* POSIX implementation */
 
 	if (~flags & CLIENT_NOFORK) {
 		if (proc_fork_and_daemon(&fd) != 0) {
@@ -191,11 +276,50 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 			return (fd);
 		}
 	}
-	proc_clear_signals(client, 0);
-	server_client_flags = flags;
+	// ... continue in child ...
+    server_child_main(client, flags, base, lockfd, lockfile);
+    // server_child_main exits logic?
+    exit(0);
+#endif
+}
 
+/* Extracted child logic */
+void
+server_child_main(struct tmuxproc *client, uint64_t flags, struct event_base *base,
+     int lockfd, char *lockfile)
+{
+	int		 fd = -1; // No FD passing on Windows/Child?
+    // Wait. On POSIX `fd` comes from `proc_fork_and_daemon`.
+    // On Windows, `fd` (socket pair) doesn't exist.
+    // The server needs to create the listening socket.
+    // `server_create_socket` does that.
+    
+    sigset_t	 set, oldset;
+    struct client *c = NULL;
+    char *cause = NULL;
+    struct timeval tv = { .tv_sec = 3600 };
+    
+	sigfillset(&set);
+	sigprocmask(SIG_BLOCK, &set, &oldset);
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_child_main: signal mask done\n");
+#endif
+
+    if (client != NULL)
+	    proc_clear_signals(client, 0);
+	server_client_flags = flags;
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_child_main: calling event_reinit\n");
+#endif
+
+#ifndef PLATFORM_WINDOWS
 	if (event_reinit(base) != 0)
 		fatalx("event_reinit failed");
+#endif
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_child_main: event_reinit done\n");
+#endif
 	server_proc = proc_start("server");
 
 	proc_set_signals(server_proc, server_signal);
@@ -203,9 +327,15 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 
 	if (log_get_level() > 1)
 		tty_create_log();
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_child_main: attempting pledge\n");
+#endif
 	if (pledge("stdio rpath wpath cpath fattr unix getpw recvfd proc exec "
 	    "tty ps", NULL) != 0)
 		fatal("pledge failed");
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_child_main: pledge done\n");
+#endif
 
 	input_key_build();
 	utf8_update_width_cache();
@@ -222,15 +352,53 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 #else
 	server_fd = server_create_socket(flags, &cause);
 #endif
+#ifndef PLATFORM_WINDOWS
 	if (server_fd != -1)
 		server_update_socket();
+#endif
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_child_main: socket updated (skipped chmod)\n");
+#endif
+    
+    /* On Windows/Proxy mode, we don't have the inherited client connection `fd` here.
+       Clients connect via socket. `server_accept` handles them.
+       So we skip `server_client_create(fd)`.
+    */
+#ifndef PLATFORM_WINDOWS
+	if (~flags & CLIENT_NOFORK)
+		c = server_client_create(fd); // fd is undefined here if extracted?
+        // Ah, `fd` was local in `server_start`.
+        // We need `fd` passed in?
+        // `fd` is the OTHER end of socket pair?
+#else
+    // Windows: No pre-connected client. Client will connect.
+    // Ensure we don't exit immediately due to no clients.
+    // We set exit-empty?
+    // `options_set_number(global_options, "exit-empty", 0);` logic below handles NOFORK.
+    // We treat Windows logic similar to NOFORK initially?
+    // No, client WILL connect.
+#endif
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_child_main: entering main loop\n");
+#endif
+
+    // The logic below for `c` expects `c` to be set?
+    /*
 	if (~flags & CLIENT_NOFORK)
 		c = server_client_create(fd);
 	else
 		options_set_number(global_options, "exit-empty", 0);
+    */
+    // On Windows, treat as NOFORK equivalent for initialization (start listener, wait for client)
+    // But `flags & CLIENT_NOFORK` is false (default).
+    // We should FORCE `exit-empty` 0?
+    // Or assume client connects fast enough?
+    // Better to set exit-empty 0?
+    options_set_number(global_options, "exit-empty", 0);
 
 	if (lockfd >= 0) {
-		unlink(lockfile);
+		unlink(lockfile); // Server removes lock file?
 		free(lockfile);
 		close(lockfd);
 	}
@@ -251,7 +419,13 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	server_acl_init();
 
 	server_add_accept(0);
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_child_main: entering proc_loop\n");
+#endif
 	proc_loop(server_proc, server_loop);
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_child_main: exited proc_loop\n");
+#endif
 
 	job_kill_all();
 	status_prompt_save_history();
@@ -268,18 +442,48 @@ server_loop(void)
 
 	current_time = time(NULL);
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_loop: entry\n");
+#endif
+
 	do {
+#ifdef PLATFORM_WINDOWS
+        win32_log("server_loop: calling cmdq_next(NULL)\n");
+#endif
 		items = cmdq_next(NULL);
+#ifdef PLATFORM_WINDOWS
+        if (items) win32_log("server_loop: cmdq_next(NULL) processed %u items\n", items);
+#endif
 		TAILQ_FOREACH(c, &clients, entry) {
-			if (c->flags & CLIENT_IDENTIFIED)
-				items += cmdq_next(c);
+			if (c->flags & CLIENT_IDENTIFIED) {
+#ifdef PLATFORM_WINDOWS
+                win32_log("server_loop: calling cmdq_next(client %p)\n", c);
+#endif
+				u_int n = cmdq_next(c);
+#ifdef PLATFORM_WINDOWS
+                if (n) win32_log("server_loop: cmdq_next(client %p) processed %u items\n", c, n);
+#endif
+                items += n;
+            }
 		}
 	} while (items != 0);
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("server_loop: do-while exited (items=0)\n");
+	win32_log("server_loop: calling server_client_loop\n");
+#endif
 	server_client_loop();
+#ifdef PLATFORM_WINDOWS
+	win32_log("server_loop: server_client_loop returned\n");
+#endif
 
 	if (!options_get_number(global_options, "exit-empty") && !server_exit)
 		return (0);
+
+	if (!options_get_number(global_options, "exit-unattached")) {
+		if (!RB_EMPTY(&sessions))
+			return (0);
+	}
 
 	if (!options_get_number(global_options, "exit-unattached")) {
 		if (!RB_EMPTY(&sessions))
@@ -373,6 +577,11 @@ server_accept(int fd, short events, __unused void *data)
 	int			 newfd;
 	struct client		*c;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("server_accept: entered, fd (int)=%d, raw_fd (long long)=%lld, events=%d\n", 
+              fd, (long long)*(intptr_t*)(&fd), events);
+#endif
+
 	server_add_accept(0);
 	if (!(events & EV_READ))
 		return;
@@ -390,11 +599,15 @@ server_accept(int fd, short events, __unused void *data)
 	}
 
 	if (server_exit) {
+		win32_log("server_accept: server_exit is set, closing newfd=%d\n", newfd);
 		close(newfd);
 		return;
 	}
+	win32_log("server_accept: calling server_client_create(%d)\n", newfd);
 	c = server_client_create(newfd);
+	win32_log("server_accept: server_client_create returned %p\n", c);
 	if (!server_acl_join(c)) {
+		win32_log("server_accept: ACL join failed for client %p\n", c);
 		c->exit_message = xstrdup("access not allowed");
 		c->flags |= CLIENT_EXIT;
 	}

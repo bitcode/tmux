@@ -538,6 +538,9 @@ tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
 	struct environ_entry			*envent;
 
 	log_debug("adding term %s", name);
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_term_create: name=%s, ncaps=%u\n", name, ncaps);
+#endif
 
 	term = xcalloc(1, sizeof *term);
 	term->tty = tty;
@@ -620,10 +623,16 @@ tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
 
 	/* These are always required. */
 	if (!tty_term_has(term, TTYC_CLEAR)) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("tty_term_create: missing clear capability\n");
+#endif
 		xasprintf(cause, "terminal does not support clear");
 		goto error;
 	}
 	if (!tty_term_has(term, TTYC_CUP)) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("tty_term_create: missing cup capability\n");
+#endif
 		xasprintf(cause, "terminal does not support cup");
 		goto error;
 	}
@@ -657,9 +666,15 @@ tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
 		tty_term_apply_overrides(term);
 
 	/* Log the capabilities. */
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_term_create: starting logging loop\n");
+#endif
 	for (i = 0; i < tty_term_ncodes(); i++)
 		log_debug("%s%s", name, tty_term_describe(term, i));
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_term_create: returning term %p\n", term);
+#endif
 	return (term);
 
 error:
@@ -907,6 +922,10 @@ tty_term_describe(struct tty_term *term, enum tty_code_code code)
 {
 	static char	 s[256];
 	char		 out[128];
+
+#ifdef PLATFORM_WINDOWS
+    // win32_log("tty_term_describe: code=%u\n", code);
+#endif
 
 	switch (term->codes[code].type) {
 	case TTYCODE_NONE:

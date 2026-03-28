@@ -489,6 +489,9 @@ tty_keys_add1(struct tty_key **tkp, const char *s, key_code key)
 void
 tty_keys_build(struct tty *tty)
 {
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_keys_build: absolute first instruction\n");
+#endif
 	const struct tty_default_key_raw	*tdkr;
 	const struct tty_default_key_xterm	*tdkx;
 	const struct tty_default_key_code	*tdkc;
@@ -500,10 +503,17 @@ tty_keys_build(struct tty *tty)
 	char					 copy[16];
 	key_code				 key;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_keys_build: entry, term %p\n", tty->term);
+#endif
+
 	if (tty->key_tree != NULL)
 		tty_keys_free(tty);
 	tty->key_tree = NULL;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_keys_build: building xterm keys\n");
+#endif
 	for (i = 0; i < nitems(tty_default_xterm_keys); i++) {
 		tdkx = &tty_default_xterm_keys[i];
 		for (j = 2; j < nitems(tty_default_xterm_modifiers); j++) {
@@ -514,6 +524,9 @@ tty_keys_build(struct tty *tty)
 			tty_keys_add(tty, copy, key);
 		}
 	}
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_keys_build: building raw keys\n");
+#endif
 	for (i = 0; i < nitems(tty_default_raw_keys); i++) {
 		tdkr = &tty_default_raw_keys[i];
 
@@ -521,6 +534,9 @@ tty_keys_build(struct tty *tty)
 		if (*s != '\0')
 			tty_keys_add(tty, s, tdkr->key);
 	}
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_keys_build: building code keys\n");
+#endif
 	for (i = 0; i < nitems(tty_default_code_keys); i++) {
 		tdkc = &tty_default_code_keys[i];
 
@@ -530,6 +546,9 @@ tty_keys_build(struct tty *tty)
 
 	}
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_keys_build: building user keys\n");
+#endif
 	o = options_get(global_options, "user-keys");
 	if (o != NULL) {
 		a = options_array_first(o);
@@ -540,6 +559,9 @@ tty_keys_build(struct tty *tty)
 			a = options_array_next(a);
 		}
 	}
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_keys_build: success\n");
+#endif
 }
 
 /* Free the entire key tree. */

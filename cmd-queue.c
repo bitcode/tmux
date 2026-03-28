@@ -736,18 +736,38 @@ cmdq_next(struct client *c)
 	u_int			 items = 0;
 	static u_int		 number;
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("cmdq_next: ENTRY c=%p name=%s\n", (void*)c, name);
+#endif
+
 	if (TAILQ_EMPTY(&queue->list)) {
 		log_debug("%s %s: empty", __func__, name);
+#ifdef PLATFORM_WINDOWS
+		win32_log("cmdq_next: empty queue, returning 0\n");
+#endif
 		return (0);
 	}
 	if (TAILQ_FIRST(&queue->list)->flags & CMDQ_WAITING) {
 		log_debug("%s %s: waiting", __func__, name);
+#ifdef PLATFORM_WINDOWS
+		win32_log("cmdq_next: waiting, returning 0\n");
+#endif
 		return (0);
 	}
 
 	log_debug("%s %s: enter", __func__, name);
+#ifdef PLATFORM_WINDOWS
+	win32_log("cmdq_next: entering for loop\n");
+#endif
 	for (;;) {
 		item = queue->item = TAILQ_FIRST(&queue->list);
+		if (item == NULL) {
+#ifdef PLATFORM_WINDOWS
+			win32_log("cmdq_next: item is NULL, breaking loop\n");
+#endif
+			break;
+		}
+
 		if (item == NULL)
 			break;
 		log_debug("%s %s: %s (%d), flags %x", __func__, name,

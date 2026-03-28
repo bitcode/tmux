@@ -106,8 +106,10 @@ tty_create_log(void)
 int
 tty_init(struct tty *tty, struct client *c)
 {
+#ifndef PLATFORM_WINDOWS
 	if (!isatty(c->fd))
 		return (-1);
+#endif
 
 	memset(tty, 0, sizeof *tty);
 	tty->client = c;
@@ -116,7 +118,7 @@ tty_init(struct tty *tty, struct client *c)
 	tty->ccolour = -1;
 	tty->fg = tty->bg = -1;
 
-	if (tcgetattr(c->fd, &tty->tio) != 0)
+	if (c->fd != -1 && tcgetattr(c->fd, &tty->tio) != 0)
 		return (-1);
 	return (0);
 }
@@ -128,7 +130,7 @@ tty_resize(struct tty *tty)
 	struct winsize	 ws;
 	u_int		 sx, sy, xpixel, ypixel;
 
-	if (ioctl(c->fd, TIOCGWINSZ, &ws) != -1) {
+	if (c->fd != -1 && ioctl(c->fd, TIOCGWINSZ, &ws) != -1) {
 		sx = ws.ws_col;
 		if (sx == 0) {
 			sx = 80;
@@ -150,10 +152,26 @@ tty_resize(struct tty *tty)
 			tty->flags |= TTY_WINSIZEQUERY;
 		}
 	} else {
+#ifdef PLATFORM_WINDOWS
+		if (c->term_sx != 0 && c->term_sy != 0) {
+			sx = c->term_sx;
+			sy = c->term_sy;
+			xpixel = c->term_xpixel;
+			ypixel = c->term_ypixel;
+			win32_log("tty_resize: using reported size %ux%u\n", sx, sy);
+		} else {
+			sx = 80;
+			sy = 24;
+			xpixel = 0;
+			ypixel = 0;
+			win32_log("tty_resize: no reported size, defaulting to 80x24\n");
+		}
+#else
 		sx = 80;
 		sy = 24;
 		xpixel = 0;
 		ypixel = 0;
+#endif
 	}
 	log_debug("%s: %s now %ux%u (%ux%u)", __func__, c->name, sx, sy,
 	    xpixel, ypixel);
@@ -253,9 +271,33 @@ tty_write_callback(__unused int fd, __unused short events, void *data)
 	size_t		 size = EVBUFFER_LENGTH(tty->out);
 	int		 nwrite;
 
-	nwrite = evbuffer_write(tty->out, c->fd);
-	if (nwrite == -1)
+#ifdef PLATFORM_WINDOWS
+	win32_log("tty_write_callback: ENTRY c->fd=%d size=%zu\n", c->fd, size);
+#endif
+
+	nwrite = -1;
+	if (c->fd != -1)
+		nwrite = evbuffer_write(tty->out, c->fd);
+#ifdef PLATFORM_WINDOWS
+	else {
+		size_t len = EVBUFFER_LENGTH(tty->out);
+		if (len > 0) {
+			char *data = xmalloc(len);
+			evbuffer_remove(tty->out, data, len);
+			win32_log("tty_write_callback: calling win32_tty_write len=%zu\n", len);
+			win32_tty_write(c, data, len);
+			win32_log("tty_write_callback: win32_tty_write returned\n");
+			free(data);
+			nwrite = len;
+		}
+	}
+#endif
+	if (nwrite == -1) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("tty_write_callback: nwrite=-1, returning early\n");
+#endif
 		return;
+	}
 	log_debug("%s: wrote %d bytes (of %zu)", c->name, nwrite, size);
 
 	if (c->redraw > 0) {
@@ -265,12 +307,28 @@ tty_write_callback(__unused int fd, __unused short events, void *data)
 			c->redraw -= nwrite;
 		log_debug("%s: waiting for redraw, %zu bytes left", c->name,
 		    c->redraw);
-	} else if (tty_block_maybe(tty))
+	} else if (tty_block_maybe(tty)) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("tty_write_callback: tty_block_maybe returned true, returning\n");
+#endif
 		return;
+	}
 
-	if (EVBUFFER_LENGTH(tty->out) != 0)
+#ifdef PLATFORM_WINDOWS
+	/* Windows: also re-add event when c->fd == -1 for file_print_buffer path */
+	if (EVBUFFER_LENGTH(tty->out) != 0) {
+		win32_log("tty_write_callback: buffer not empty, activating event\n");
+		event_active(&tty->event_out, EV_WRITE, 1);
+	}
+	win32_log("tty_write_callback: EXIT success\n");
+#else
+
+	if (EVBUFFER_LENGTH(tty->out) != 0 && c->fd != -1)
 		event_add(&tty->event_out, NULL);
+#endif
 }
+
+
 
 int
 tty_open(struct tty *tty, char **cause)
@@ -284,6 +342,9 @@ tty_open(struct tty *tty, char **cause)
 		return (-1);
 	}
 	tty->flags |= TTY_OPENED;
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_open: flags set, setting up events for fd %d\n", c->fd);
+#endif
 
 	tty->flags &= ~(TTY_NOCURSOR|TTY_FREEZE|TTY_BLOCK|TTY_TIMER);
 
@@ -293,18 +354,36 @@ tty_open(struct tty *tty, char **cause)
 	if (tty->in == NULL)
 		fatal("out of memory");
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_open: event_in and buffer_in set up\n");
+#endif
+
 	event_set(&tty->event_out, c->fd, EV_WRITE, tty_write_callback, tty);
 	tty->out = evbuffer_new();
 	if (tty->out == NULL)
 		fatal("out of memory");
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_open: event_out and buffer_out set up\n");
+#endif
+
 	evtimer_set(&tty->clipboard_timer, tty_clipboard_query_callback, tty);
 	evtimer_set(&tty->start_timer, tty_start_timer_callback, tty);
 	evtimer_set(&tty->timer, tty_timer_callback, tty);
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_open: calling tty_start_tty\n");
+#endif
 	tty_start_tty(tty);
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_open: tty_start_tty returned\n");
+    win32_log("tty_open: calling tty_keys_build\n");
+#endif
 	tty_keys_build(tty);
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_open: returning 0\n");
+#endif
 	return (0);
 }
 
@@ -340,8 +419,18 @@ tty_start_tty(struct tty *tty)
 	struct client	*c = tty->client;
 	struct termios	 tio;
 
-	setblocking(c->fd, 0);
-	event_add(&tty->event_in, NULL);
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_start_tty: entry, fd=%d\n", c->fd);
+#endif
+
+	if (c->fd != -1) {
+		setblocking(c->fd, 0);
+		event_add(&tty->event_in, NULL);
+	}
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_start_tty: setting up termios\n");
+#endif
 
 	memcpy(&tio, &tty->tio, sizeof tio);
 	tio.c_iflag &= ~(IXON|IXOFF|ICRNL|INLCR|IGNCR|IMAXBEL|ISTRIP);
@@ -351,13 +440,23 @@ tty_start_tty(struct tty *tty)
 	    ECHOKE|ISIG);
 	tio.c_cc[VMIN] = 1;
 	tio.c_cc[VTIME] = 0;
-	if (tcsetattr(c->fd, TCSANOW, &tio) == 0)
-		tcflush(c->fd, TCOFLUSH);
+	if (c->fd != -1) {
+		if (tcsetattr(c->fd, TCSANOW, &tio) == 0)
+			tcflush(c->fd, TCOFLUSH);
+	}
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_start_tty: termios set up, putting codes\n");
+#endif
 
 	tty_putcode(tty, TTYC_SMCUP);
 
 	tty_putcode(tty, TTYC_SMKX);
 	tty_putcode(tty, TTYC_CLEAR);
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_start_tty: putcode done, checking ACS\n");
+#endif
 
 	if (tty_acs_needed(tty)) {
 		log_debug("%s: using capabilities for ACS", c->name);
@@ -365,6 +464,9 @@ tty_start_tty(struct tty *tty)
 	} else
 		log_debug("%s: using UTF-8 for ACS", c->name);
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_start_tty: calling tty_putcode(TTYC_CNORM)\n");
+#endif
 	tty_putcode(tty, TTYC_CNORM);
 	if (tty_term_has(tty->term, TTYC_KMOUS)) {
 		tty_puts(tty, "\033[?1000l\033[?1002l\033[?1003l");
@@ -378,9 +480,15 @@ tty_start_tty(struct tty *tty)
 		tty_puts(tty, "\033[?2031h\033[?996n");
 	}
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_start_tty: calling tty_start_start_timer\n");
+#endif
 	tty_start_start_timer(tty);
 
 	tty->flags |= TTY_STARTED;
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_start_tty: calling tty_invalidate\n");
+#endif
 	tty_invalidate(tty);
 
 	if (tty->ccolour != -1)
@@ -389,6 +497,10 @@ tty_start_tty(struct tty *tty)
 	tty->mouse_drag_flag = 0;
 	tty->mouse_drag_update = NULL;
 	tty->mouse_drag_release = NULL;
+
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_start_tty: success, returning\n");
+#endif
 }
 
 void
@@ -396,6 +508,21 @@ tty_send_requests(struct tty *tty)
 {
 	if (~tty->flags & TTY_STARTED)
 		return;
+
+#ifdef PLATFORM_WINDOWS
+	/*
+	 * On Windows, skip sending DA queries. The Windows Console/ConPTY
+	 * would respond with DA sequences, but these responses can't be
+	 * properly captured through the IPC channel (client has no direct
+	 * tty fd readable by the server). The responses would appear as
+	 * raw escape sequences in the terminal output.
+	 *
+	 * Instead, just mark all request flags as satisfied.
+	 */
+	tty->flags |= TTY_ALL_REQUEST_FLAGS;
+	tty->last_requests = time(NULL);
+	return;
+#endif
 
 	if (tty->term->flags & TERM_VT100LIKE) {
 		if (~tty->flags & TTY_HAVEDA)
@@ -627,7 +754,14 @@ tty_add(struct tty *tty, const char *buf, size_t len)
 {
 	struct client	*c = tty->client;
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("tty_add: client %s adding %zu bytes: '%.*s'\n", c->name, len, (int)len, buf);
+#endif
+
 	if (tty->flags & TTY_BLOCK) {
+#ifdef PLATFORM_WINDOWS
+		win32_log("tty_add: TTY_BLOCK set, discarding %zu bytes\n", len);
+#endif
 		tty->discarded += len;
 		return;
 	}
@@ -638,9 +772,28 @@ tty_add(struct tty *tty, const char *buf, size_t len)
 
 	if (tty_log_fd != -1)
 		write(tty_log_fd, buf, len);
-	if (tty->flags & TTY_STARTED)
+
+#ifdef PLATFORM_WINDOWS
+	/* Windows: c->fd is -1, so event_add won't work.
+	 * Use event_once to schedule a deferred flush after rendering completes.
+	 * This breaks the infinite loop in server_loop. */
+	if ((tty->flags & TTY_STARTED) && c->fd == -1) {
+		/* Don't drain buffer here - let it accumulate.
+		 * Schedule tty_write_callback via event_once if not already pending.
+		 * We use event_add with the existing event_out which was registered
+		 * for fd=-1 (won't trigger on its own, but we can activate it). */
+		win32_log("tty_add: activating event_out for client %s\n", c->name);
+		event_active(&tty->event_out, EV_WRITE, 1);
+	} else
+#endif
+	if ((tty->flags & TTY_STARTED) && c->fd != -1)
 		event_add(&tty->event_out, NULL);
 }
+
+
+
+
+
 
 void
 tty_puts(struct tty *tty, const char *s)
@@ -1484,6 +1637,12 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 	    px, py, nx, atx, aty);
 	log_debug("%s: defaults: fg=%d, bg=%d", __func__, defaults->fg,
 	    defaults->bg);
+
+#ifdef PLATFORM_WINDOWS
+	win32_log("tty_draw_line: ENTRY client=%s px=%u py=%u nx=%u atx=%u aty=%u\n",
+		c->name, px, py, nx, atx, aty);
+#endif
+
 
 	/*
 	 * py is the line in the screen to draw.
@@ -2406,20 +2565,51 @@ tty_reset(struct tty *tty)
 {
 	struct grid_cell	*gc = &tty->cell;
 
+#ifdef PLATFORM_WINDOWS
+	win32_log("tty_reset: ENTRY tty=%p gc=%p\n", (void*)tty, (void*)gc);
+#endif
+
 	if (!grid_cells_equal(gc, &grid_default_cell)) {
-		if (gc->link != 0)
+#ifdef PLATFORM_WINDOWS
+		win32_log("tty_reset: cells not equal, resetting\n");
+#endif
+		if (gc->link != 0) {
+#ifdef PLATFORM_WINDOWS
+			win32_log("tty_reset: clearing link\n");
+#endif
 			tty_putcode_ss(tty, TTYC_HLS, "", "");
-		if ((gc->attr & GRID_ATTR_CHARSET) && tty_acs_needed(tty))
+		}
+		if ((gc->attr & GRID_ATTR_CHARSET) && tty_acs_needed(tty)) {
+#ifdef PLATFORM_WINDOWS
+			win32_log("tty_reset: clearing ACS\n");
+#endif
 			tty_putcode(tty, TTYC_RMACS);
+		}
+#ifdef PLATFORM_WINDOWS
+		win32_log("tty_reset: calling SGR0\n");
+#endif
 		tty_putcode(tty, TTYC_SGR0);
+#ifdef PLATFORM_WINDOWS
+		win32_log("tty_reset: copying default cell\n");
+#endif
 		memcpy(gc, &grid_default_cell, sizeof *gc);
 	}
+#ifdef PLATFORM_WINDOWS
+	win32_log("tty_reset: updating last_cell\n");
+#endif
 	memcpy(&tty->last_cell, &grid_default_cell, sizeof tty->last_cell);
+#ifdef PLATFORM_WINDOWS
+	win32_log("tty_reset: EXIT\n");
+#endif
 }
+
 
 void
 tty_invalidate(struct tty *tty)
 {
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_invalidate: entry\n");
+#endif
 	memcpy(&tty->cell, &grid_default_cell, sizeof tty->cell);
 	memcpy(&tty->last_cell, &grid_default_cell, sizeof tty->last_cell);
 
@@ -2428,18 +2618,36 @@ tty_invalidate(struct tty *tty)
 	tty->rlower = tty->rright = UINT_MAX;
 
 	if (tty->flags & TTY_STARTED) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("tty_invalidate: checking margin\n");
+#endif
 		if (tty_use_margin(tty))
 			tty_putcode(tty, TTYC_ENMG);
+#ifdef PLATFORM_WINDOWS
+        win32_log("tty_invalidate: putting SGR0\n");
+#endif
 		tty_putcode(tty, TTYC_SGR0);
 
 		tty->mode = ALL_MODES;
+#ifdef PLATFORM_WINDOWS
+        win32_log("tty_invalidate: updating mode\n");
+#endif
 		tty_update_mode(tty, MODE_CURSOR, NULL);
 
+#ifdef PLATFORM_WINDOWS
+        win32_log("tty_invalidate: moving cursor\n");
+#endif
 		tty_cursor(tty, 0, 0);
+#ifdef PLATFORM_WINDOWS
+        win32_log("tty_invalidate: turning off region/margin\n");
+#endif
 		tty_region_off(tty);
 		tty_margin_off(tty);
 	} else
 		tty->mode = MODE_CURSOR;
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_invalidate: success\n");
+#endif
 }
 
 /* Turn off margin. */
@@ -2558,6 +2766,10 @@ tty_cursor(struct tty *tty, u_int cx, u_int cy)
 	u_int		 thisx, thisy;
 	int		 change;
 
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_cursor: wanting %u,%u (current %u,%u)\n", cx, cy, tty->cx, tty->cy);
+#endif
+
 	if (tty->flags & TTY_BLOCK)
 		return;
 
@@ -2580,11 +2792,18 @@ tty_cursor(struct tty *tty, u_int cx, u_int cy)
 		return;
 
 	/* Currently at the very end of the line - use absolute movement. */
-	if (thisx > tty->sx - 1)
+	if (thisx > tty->sx - 1) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("tty_cursor: thisx > tty->sx - 1, going absolute\n");
+#endif
 		goto absolute;
+	}
 
 	/* Move to home position (0, 0). */
 	if (cx == 0 && cy == 0 && tty_term_has(term, TTYC_HOME)) {
+#ifdef PLATFORM_WINDOWS
+        win32_log("tty_cursor: moving home\n");
+#endif
 		tty_putcode(tty, TTYC_HOME);
 		goto out;
 	}
@@ -2690,12 +2909,21 @@ tty_cursor(struct tty *tty, u_int cx, u_int cy)
 	}
 
 absolute:
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_cursor: applying absolute movement (CUP) for %u,%u\n", cy, cx);
+#endif
 	/* Absolute movement. */
 	tty_putcode_ii(tty, TTYC_CUP, cy, cx);
 
 out:
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_cursor: updating tty->cx/cy\n");
+#endif
 	tty->cx = cx;
 	tty->cy = cy;
+#ifdef PLATFORM_WINDOWS
+    win32_log("tty_cursor: success\n");
+#endif
 }
 
 static void
