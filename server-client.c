@@ -3482,8 +3482,23 @@ server_client_dispatch(struct imsg *imsg, void *arg)
 			goto bad;
 		break;
 	case MSG_RESIZE:
+#ifdef PLATFORM_WINDOWS
+		if (datalen != 0 && datalen != sizeof(struct winsize))
+			goto bad;
+		if (datalen == sizeof(struct winsize)) {
+			struct winsize ws;
+			memcpy(&ws, imsg->data, sizeof ws);
+			if (ws.ws_col > 0 && ws.ws_row > 0) {
+				c->term_sx = ws.ws_col;
+				c->term_sy = ws.ws_row;
+				win32_log("MSG_RESIZE: updated term size to %ux%u\n",
+				    c->term_sx, c->term_sy);
+			}
+		}
+#else
 		if (datalen != 0)
 			goto bad;
+#endif
 
 		if (c->flags & CLIENT_CONTROL)
 			break;
@@ -3847,7 +3862,7 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 	if (c->flags & CLIENT_CONTROL)
 		control_start(c);
 #ifdef PLATFORM_WINDOWS
-	else if (1) {
+	else if (c->ttyname != NULL && *c->ttyname != '\0') {
 #else
 	else if (c->fd != -1) {
 #endif

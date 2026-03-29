@@ -198,8 +198,11 @@ cmd_run_shell_timer(__unused int fd, __unused short events, void* arg)
 		}
 		if (job_run(cmd, 0, NULL, NULL, cdata->s, cdata->cwd, NULL,
 		    cmd_run_shell_callback, cmd_run_shell_free, cdata,
-		    cdata->flags, -1, -1) == NULL)
+		    cdata->flags, -1, -1) == NULL) {
+			if (cdata->item != NULL)
+				cmdq_continue(cdata->item);
 			cmd_run_shell_free(cdata);
+		}
 		return;
 	}
 

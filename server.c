@@ -156,6 +156,13 @@ server_create_socket(uint64_t flags, char **cause)
 		goto fail;
 	}
 #ifdef PLATFORM_WINDOWS
+	/* Make listening socket non-blocking so accept() returns EWOULDBLOCK
+	 * when no connection is pending (timer-poll accept pattern). */
+	{
+		u_long nb = 1;
+		SOCKET s = win32_get_real_socket(fd);
+		ioctlsocket(s, FIONBIO, &nb);
+	}
     win32_log("server_create_socket: success, fd=%d\n", fd);
 #endif
 	setblocking(fd, 0);
@@ -242,8 +249,10 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
     // Child creates socket.
     // Parent waits for socket.
     
-    // Spawn
-    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, DETACHED_PROCESS, NULL, NULL, &si, &pi)) {
+    /* Do NOT inherit handles: the client's stdout/stderr pipes (from
+     * Start-Process -RedirectStandardOutput) must not leak into the server
+     * process, or the pipe will never reach EOF and callers will hang. */
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
 #ifdef PLATFORM_WINDOWS
         win32_log("server_start: CreateProcess failed %d\n", GetLastError());
 #endif
@@ -583,13 +592,21 @@ server_accept(int fd, short events, __unused void *data)
 #endif
 
 	server_add_accept(0);
+#ifndef PLATFORM_WINDOWS
 	if (!(events & EV_READ))
 		return;
+#endif
+	/* On Windows, always try accept() — we use timer polling, not EV_READ */
 
 	newfd = accept(fd, (struct sockaddr *) &sa, &slen);
 	if (newfd == -1) {
 		if (errno == EAGAIN || errno == EINTR || errno == ECONNABORTED)
 			return;
+#ifdef PLATFORM_WINDOWS
+		/* WSAEWOULDBLOCK means no connection pending — normal for timer poll */
+		if (errno == EWOULDBLOCK)
+			return;
+#endif
 		if (errno == ENFILE || errno == EMFILE) {
 			/* Delete and don't try again for 1 second. */
 			server_add_accept(1);
@@ -628,6 +645,18 @@ server_add_accept(int timeout)
 	if (event_initialized(&server_ev_accept))
 		event_del(&server_ev_accept);
 
+#ifdef PLATFORM_WINDOWS
+	/*
+	 * Winsock select() does not support AF_UNIX sockets, so EV_READ on the
+	 * listening socket never fires.  Use a 50ms polling timer instead so
+	 * server_accept is called frequently and can pick up new connections.
+	 */
+	{
+		struct timeval poll_tv = { 0, timeout == 0 ? 50000 : timeout * 1000000 };
+		event_set(&server_ev_accept, server_fd, EV_TIMEOUT, server_accept, NULL);
+		event_add(&server_ev_accept, &poll_tv);
+	}
+#else
 	if (timeout == 0) {
 		event_set(&server_ev_accept, server_fd, EV_READ, server_accept,
 		    NULL);
@@ -637,6 +666,7 @@ server_add_accept(int timeout)
 		    server_accept, NULL);
 		event_add(&server_ev_accept, &tv);
 	}
+#endif
 }
 
 /* Signal handler. */

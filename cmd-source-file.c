@@ -212,7 +212,12 @@ cmd_source_file_exec(struct cmd *self, struct cmdq_item *item)
 			continue;
 		}
 
-		if (*path == '/')
+		if (*path == '/'
+#ifdef PLATFORM_WINDOWS
+		    || (isalpha((unsigned char)*path) && path[1] == ':')
+		    || *path == '\\'
+#endif
+		    )
 			pattern = xstrdup(path);
 		else
 			xasprintf(&pattern, "%s/%s", cwd, path);

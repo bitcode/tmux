@@ -61,9 +61,67 @@ static const char	*client_execcmd;
 static int		 client_attached;
 static struct client_files client_files = RB_INITIALIZER(&client_files);
 
+#ifdef PLATFORM_WINDOWS
+static DWORD		 client_saved_stdin_mode = 0;
+static DWORD		 client_saved_stdout_mode = 0;
+static int		 client_console_mode_saved = 0;
+#endif
+
 static __dead void	 client_exec(const char *,const char *);
 
 #ifdef PLATFORM_WINDOWS
+struct client_resize_thread_arg {
+	int	fd;	/* socketpair fd to signal resize */
+};
+
+/*
+ * Resize monitor thread: polls the console window size every 250ms and
+ * notifies the event loop when it changes, so the server can send MSG_RESIZE.
+ * Polling avoids concurrency issues with the input thread using ReadFile on
+ * the same console handle.
+ */
+unsigned int __stdcall
+client_resize_thread(void *arg)
+{
+	struct client_resize_thread_arg *a = arg;
+	int	fd = a->fd;
+	SHORT	last_cols = 0, last_rows = 0;
+	CONSOLE_SCREEN_BUFFER_INFO csbi;
+
+	free(a);
+
+	/* Record initial size */
+	if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+		last_cols = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+		last_rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+	}
+
+	win32_log("client_resize_thread: started, fd=%d, initial size=%dx%d\n",
+	    fd, (int)last_cols, (int)last_rows);
+
+	while (1) {
+		Sleep(250);
+
+		if (!GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi))
+			continue;
+
+		SHORT cols = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+		SHORT rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+
+		if (cols != last_cols || rows != last_rows) {
+			last_cols = cols;
+			last_rows = rows;
+			win32_log("client_resize_thread: resize to %dx%d, notifying\n",
+			    (int)cols, (int)rows);
+			char notify = 'R';
+			write(fd, &notify, 1);
+		}
+	}
+
+	win32_log("client_resize_thread: exiting\n");
+	return (0);
+}
+
 unsigned int __stdcall
 client_input_thread(void *arg)
 {
@@ -100,8 +158,8 @@ client_input_thread(void *arg)
 static void
 client_input_callback(__unused int fd_ignore, __unused short events, void *arg)
 {
-	/* 
-	 * NOTE: libevent passes the raw SOCKET handle as fd_ignore, but we need 
+	/*
+	 * NOTE: libevent passes the raw SOCKET handle as fd_ignore, but we need
 	 * the mapped fd that we stored in arg to use with win32_read().
 	 */
 	int	mapped_fd = (int)(intptr_t)arg;
@@ -119,6 +177,35 @@ client_input_callback(__unused int fd_ignore, __unused short events, void *arg)
 		win32_log("client_input_callback: EOF on input socket\n");
 	} else {
 		win32_log("client_input_callback: read error, errno=%d\n", errno);
+	}
+}
+
+static void
+client_resize_callback(__unused int fd_ignore, __unused short events, void *arg)
+{
+	int	mapped_fd = (int)(intptr_t)arg;
+	char	buf[32];
+	ssize_t	n;
+
+	/* Drain notification bytes sent by client_resize_thread */
+	n = read(mapped_fd, buf, sizeof buf);
+	if (n > 0) {
+		struct winsize		 ws;
+		CONSOLE_SCREEN_BUFFER_INFO csbi;
+
+		memset(&ws, 0, sizeof ws);
+		if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+			ws.ws_col = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+			ws.ws_row = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+			if (ws.ws_col < 10) ws.ws_col = 10;
+			if (ws.ws_row < 3)  ws.ws_row = 3;
+		} else {
+			ws.ws_col = 80;
+			ws.ws_row = 24;
+		}
+		win32_log("client_resize_callback: sending MSG_RESIZE %ux%u\n",
+		    ws.ws_col, ws.ws_row);
+		proc_send(client_peer, MSG_RESIZE, -1, &ws, sizeof ws);
 	}
 }
 #endif
@@ -171,6 +258,9 @@ client_connect(struct event_base *base, const char *path, uint64_t flags)
 	struct sockaddr_un	sa;
 	size_t			size;
 	int			fd = -1, lockfd = -1, locked = 0;
+#ifdef PLATFORM_WINDOWS
+	int			server_started = 0, retry_count = 0;
+#endif
 	char		       *lockfile = NULL;
 
 #ifdef PLATFORM_WINDOWS
@@ -292,11 +382,35 @@ retry:
         goto failed;
     }
 #ifdef PLATFORM_WINDOWS
+    server_started = 1;
+    retry_count = 0;
     win32_log("client_connect: server_start success, retrying connect\n");
-    Sleep(200); // Give server a moment to bind
+    Sleep(300); /* Give server a moment to bind */
 #endif
     goto retry;
-	}
+	} else {
+#ifdef PLATFORM_WINDOWS
+        /* connect() succeeded — but if we're in a post-server_start retry loop,
+         * the server may have accepted and immediately dropped us (race).
+         * Break out: fall through to the success path below. */
+        server_started = 0; /* stop retry guard */
+#endif
+    }
+#ifdef PLATFORM_WINDOWS
+    /* connect() failed and server was already started — wait and retry */
+    if (server_started) {
+        retry_count++;
+        if (retry_count > 20) {
+            win32_log("client_connect: server started but connect still failing after %d retries\n", retry_count);
+            goto failed;
+        }
+        win32_log("client_connect: server started, connect retry %d/20\n", retry_count);
+        close(fd);
+        fd = -1;
+        Sleep(200);
+        goto retry;
+    }
+#endif
 
 	if (locked && lockfd >= 0) {
 #ifdef PLATFORM_WINDOWS
@@ -630,6 +744,16 @@ client_main(struct event_base *base, int argc, char **argv, uint64_t flags,
 	setblocking(STDOUT_FILENO, 1);
 	setblocking(STDERR_FILENO, 1);
 
+#ifdef PLATFORM_WINDOWS
+	/* Restore console modes so the shell is usable after detach. */
+	if (client_console_mode_saved) {
+		HANDLE hIn  = GetStdHandle(STD_INPUT_HANDLE);
+		HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+		if (hIn  != INVALID_HANDLE_VALUE) SetConsoleMode(hIn,  client_saved_stdin_mode);
+		if (hOut != INVALID_HANDLE_VALUE) SetConsoleMode(hOut, client_saved_stdout_mode);
+	}
+#endif
+
 	/* Print the exit message, if any, and exit. */
 	if (client_attached) {
 		if (client_exitreason != CLIENT_EXIT_NONE)
@@ -691,31 +815,30 @@ client_send_identify(const char *ttynam, const char *termname, char **caps,
 	
 	/* Configure stdout for VT processing */
 	if (GetConsoleMode(hOut, &dwMode)) {
+		client_saved_stdout_mode = dwMode;
 		dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-		/* Note: NOT setting DISABLE_NEWLINE_AUTO_RETURN - tmux uses absolute cursor positioning */
 		if (!SetConsoleMode(hOut, dwMode)) {
 			win32_log("client_send_identify: SetConsoleMode(STDOUT, VT) failed, error=%lu\n", GetLastError());
 		} else {
 			win32_log("client_send_identify: STDOUT VT enabled, hOut=%p mode=0x%lx\n", (void*)hOut, dwMode);
 		}
 	}
-	
+
 	/* Configure stdin for raw VT input mode (no echo, no line buffering) */
 	if (GetConsoleMode(hIn, &dwMode)) {
-		DWORD oldMode = dwMode;
+		client_saved_stdin_mode = dwMode;
+		client_console_mode_saved = 1;
 		/* Clear line input mode and echo - we want raw keystrokes */
-		dwMode &= ~ENABLE_LINE_INPUT;        /* Don't wait for Enter */
-		dwMode &= ~ENABLE_ECHO_INPUT;        /* Don't echo chars locally */
-		dwMode &= ~ENABLE_PROCESSED_INPUT;   /* Don't interpret Ctrl+C locally */
-		/* Enable VT sequences for special keys (arrows, function keys) */
+		dwMode &= ~ENABLE_LINE_INPUT;
+		dwMode &= ~ENABLE_ECHO_INPUT;
+		dwMode &= ~ENABLE_PROCESSED_INPUT;
 		dwMode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
-		/* Keep window input for resize events */
 		dwMode |= ENABLE_WINDOW_INPUT;
-		
 		if (!SetConsoleMode(hIn, dwMode)) {
 			win32_log("client_send_identify: SetConsoleMode(STDIN, raw) failed, error=%lu\n", GetLastError());
 		} else {
-			win32_log("client_send_identify: STDIN raw mode enabled, old=0x%lx new=0x%lx\n", oldMode, dwMode);
+			win32_log("client_send_identify: STDIN raw mode enabled, old=0x%lx new=0x%lx\n",
+			    client_saved_stdin_mode, dwMode);
 		}
 	}
 #endif
@@ -981,6 +1104,18 @@ client_dispatch_wait(struct imsg *imsg)
 				/* Pass input_fds[0] as arg so callback can use mapped fd, not raw SOCKET */
 				win32_event_set(ev, input_fds[0], EV_READ | EV_PERSIST, client_input_callback, (void*)(intptr_t)input_fds[0]);
 				event_add(ev, NULL);
+			}
+
+			/* Start resize monitor thread */
+			int resize_fds[2];
+			if (win32_socketpair(AF_INET, SOCK_STREAM, 0, resize_fds) == 0) {
+				win32_log("client_dispatch_attached: resize_fds[0]=%d, resize_fds[1]=%d\n", resize_fds[0], resize_fds[1]);
+				struct client_resize_thread_arg *ra = xmalloc(sizeof *ra);
+				ra->fd = resize_fds[1];
+				_beginthreadex(NULL, 0, client_resize_thread, ra, 0, NULL);
+				struct event *rev = xmalloc(sizeof *rev);
+				win32_event_set(rev, resize_fds[0], EV_READ | EV_PERSIST, client_resize_callback, (void*)(intptr_t)resize_fds[0]);
+				event_add(rev, NULL);
 			}
 		}
 #endif

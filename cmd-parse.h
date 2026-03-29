@@ -35,8 +35,8 @@
    especially those whose name start with YY_ or yy_.  They are
    private implementation details that can be changed or removed.  */
 
-#ifndef YY_YY_TMUX_CMD_PARSE_H_INCLUDED
-# define YY_YY_TMUX_CMD_PARSE_H_INCLUDED
+#ifndef YY_YY_CMD_PARSE_H_INCLUDED
+# define YY_YY_CMD_PARSE_H_INCLUDED
 /* Debug traces.  */
 #ifndef YYDEBUG
 # define YYDEBUG 0
@@ -71,7 +71,7 @@ extern int yydebug;
 #if ! defined YYSTYPE && ! defined YYSTYPE_IS_DECLARED
 union YYSTYPE
 {
-#line 102 "tmux/cmd-parse.y"
+#line 102 "cmd-parse.y"
 
 	char					 *token;
 	struct cmd_parse_arguments		 *arguments;
@@ -84,7 +84,7 @@ union YYSTYPE
 	struct cmd_parse_commands		 *commands;
 	struct cmd_parse_command		 *command;
 
-#line 88 "tmux/cmd-parse.h"
+#line 88 "cmd-parse.h"
 
 };
 typedef union YYSTYPE YYSTYPE;
@@ -99,4 +99,4 @@ extern YYSTYPE yylval;
 int yyparse (void);
 
 
-#endif /* !YY_YY_TMUX_CMD_PARSE_H_INCLUDED  */
+#endif /* !YY_YY_CMD_PARSE_H_INCLUDED  */

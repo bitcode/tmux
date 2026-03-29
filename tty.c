@@ -130,7 +130,12 @@ tty_resize(struct tty *tty)
 	struct winsize	 ws;
 	u_int		 sx, sy, xpixel, ypixel;
 
+#ifdef PLATFORM_WINDOWS
+	if (0) {  /* skip ioctl on Windows — c->fd is a socket, use c->term_sx instead */
+		(void)ws;
+#else
 	if (c->fd != -1 && ioctl(c->fd, TIOCGWINSZ, &ws) != -1) {
+#endif
 		sx = ws.ws_col;
 		if (sx == 0) {
 			sx = 80;

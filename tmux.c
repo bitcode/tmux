@@ -424,7 +424,23 @@ main(int argc, char **argv)
 #ifdef PLATFORM_WINDOWS
     win32_log("PWD set\n");
 #endif
+#ifdef PLATFORM_WINDOWS
+    {
+        /* On Windows use %APPDATA%\tmux\tmux.conf as the default config path.
+         * expand_paths with no_realpath=1 keeps non-existent paths so the
+         * server will attempt to load the file when it does exist. */
+        const char *appdata = getenv("APPDATA");
+        if (appdata != NULL && appdata[0] != '\0') {
+            char win_conf[MAX_PATH];
+            snprintf(win_conf, sizeof(win_conf), "%s\\tmux\\tmux.conf", appdata);
+            cfg_files = xreallocarray(cfg_files, cfg_nfiles + 1, sizeof *cfg_files);
+            cfg_files[cfg_nfiles++] = xstrdup(win_conf);
+        }
+    }
+    win32_log("expand_paths (Windows) done\n");
+#else
 	expand_paths(TMUX_CONF, &cfg_files, &cfg_nfiles, 1);
+#endif
 #ifdef PLATFORM_WINDOWS
     win32_log("expand_paths done\n");
 #endif
