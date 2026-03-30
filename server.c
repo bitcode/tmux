@@ -222,11 +222,31 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
     win32_log("server_start: exe_path=%s\n", exe_path);
 #endif
     
-    // Check if we need to pass socket path (-S)
-    if (socket_path) {
-        xasprintf(&cmdline, "\"%s\" -S \"%s\" __win32_server", exe_path, socket_path);
-    } else    {
-        xasprintf(&cmdline, "\"%s\" __win32_server", exe_path);
+    /* Build command line, forwarding -f config files and -S socket path. */
+    {
+        char *p = NULL;
+        u_int i;
+
+        xasprintf(&p, "\"%s\"", exe_path);
+        if (socket_path) {
+            char *tmp;
+            xasprintf(&tmp, "%s -S \"%s\"", p, socket_path);
+            free(p);
+            p = tmp;
+        }
+        /* Forward any -f config file overrides to the server process. */
+        for (i = 0; i < cfg_nfiles; i++) {
+            char *tmp;
+            xasprintf(&tmp, "%s -f \"%s\"", p, cfg_files[i]);
+            free(p);
+            p = tmp;
+        }
+        {
+            char *tmp;
+            xasprintf(&tmp, "%s __win32_server", p);
+            free(p);
+            cmdline = tmp;
+        }
     }
 
 #ifdef PLATFORM_WINDOWS
@@ -429,6 +449,8 @@ server_child_main(struct tmuxproc *client, uint64_t flags, struct event_base *ba
 
 	server_add_accept(0);
 #ifdef PLATFORM_WINDOWS
+    if (win32_job_init() != 0)
+        win32_log("server_child_main: win32_job_init failed (if-shell will not work)\n");
     win32_log("server_child_main: entering proc_loop\n");
 #endif
 	proc_loop(server_proc, server_loop);

@@ -60,6 +60,11 @@ file_get_path(struct client *c, const char *file)
 	}
 	if (*path == '/')
 		return (path);
+#ifdef PLATFORM_WINDOWS
+	/* Accept Windows absolute paths: C:\..., C:/..., \\UNC */
+	if ((isalpha((unsigned char)*path) && path[1] == ':') || *path == '\\')
+		return (path);
+#endif
 	xasprintf(&full_path, "%s/%s", server_client_get_cwd(c, NULL), path);
 	return (full_path);
 }
@@ -933,6 +938,43 @@ file_read_open(struct client_files *files, struct tmuxpeer *peer,
 		error = errno;
 		goto reply;
 	}
+
+
+#ifdef PLATFORM_WINDOWS
+	/*
+	 * On Windows, regular file fds are not compatible with libevent's
+	 * event loop (which uses WaitForMultipleObjects/select on sockets).
+	 * Read the file synchronously and send MSG_READ + MSG_READ_DONE
+	 * directly instead of using bufferevent.
+	 */
+	{
+		char			 rbuf[BUFSIZ];
+		ssize_t			 rn;
+		struct msg_read_data	*rmsg;
+		struct msg_read_done	 rdone;
+		size_t			 rmsglen;
+
+		rmsg = xmalloc(sizeof *rmsg + sizeof rbuf);
+		for (;;) {
+			rn = read(cf->fd, rbuf, sizeof rbuf);
+			if (rn <= 0)
+				break;
+			rmsglen = sizeof *rmsg + (size_t)rn;
+			rmsg = xrealloc(rmsg, rmsglen);
+			rmsg->stream = cf->stream;
+			memcpy(rmsg + 1, rbuf, (size_t)rn);
+			proc_send(cf->peer, MSG_READ, -1, rmsg, rmsglen);
+		}
+		free(rmsg);
+		close(cf->fd);
+		cf->fd = -1;
+		rdone.stream = cf->stream;
+		rdone.error = (rn < 0) ? errno : 0;
+		proc_send(cf->peer, MSG_READ_DONE, -1, &rdone, sizeof rdone);
+		file_free(cf);
+		return;
+	}
+#endif
 
 	cf->event = bufferevent_new(cf->fd, file_read_callback, NULL,
 	    file_read_error_callback, cf);

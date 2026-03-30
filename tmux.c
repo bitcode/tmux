@@ -79,13 +79,23 @@ getshell(void)
 int
 checkshell(const char *shell)
 {
-	if (shell == NULL || *shell != '/')
+	if (shell == NULL || shell[0] == '\0')
+		return (0);
+#ifdef PLATFORM_WINDOWS
+	/* On Windows, executables don't start with '/'; accept any non-empty path */
+	if (strcmp(shell, "/bin/sh") == 0 || strcmp(shell, "/bin/csh") == 0 ||
+	    strcmp(shell, "/usr/bin/false") == 0)
+		return (0);
+	return (1);
+#else
+	if (*shell != '/')
 		return (0);
 	if (areshell(shell))
 		return (0);
 	if (access(shell, X_OK) != 0)
 		return (0);
 	return (1);
+#endif
 }
 
 static int

@@ -82,6 +82,56 @@ job_run(const char *cmd, int argc, char **argv, struct environ *e,
 	sigset_t	  set, oldset;
 	struct winsize	  ws;
 	char		**argvp, tty[TTY_NAME_MAX], *argv0;
+
+#ifdef PLATFORM_WINDOWS
+	/*
+	 * Windows Fast Path: fork()/socketpair()/execl() do not exist on Win32.
+	 * Use CreateProcess + RegisterWaitForSingleObject + self-pipe instead.
+	 * Only the exit code is captured (sufficient for if-shell, run-shell).
+	 * stdout/stderr capture (pipe-pane, update callbacks) is not yet wired.
+	 */
+	{
+		const char *win_shell = NULL;
+		struct options *win_oo;
+
+		if (flags & JOB_DEFAULTSHELL) {
+			win_oo = (s != NULL) ? s->options : global_s_options;
+			win_shell = options_get_string(win_oo, "default-shell");
+			if (!checkshell(win_shell))
+				win_shell = NULL;
+		}
+
+		if (cmd == NULL) {
+			log_debug("%s: Windows: argc-based commands not supported", __func__);
+			return NULL;
+		}
+
+		pid = win32_job_run(cmd, win_shell);
+		if (pid == -1) {
+			log_debug("%s: win32_job_run failed for: %s", __func__, cmd);
+			return NULL;
+		}
+
+		job = xcalloc(1, sizeof *job);
+		job->state = JOB_RUNNING;
+		job->flags = flags;
+		job->cmd = xstrdup(cmd);
+		job->pid = pid;
+		job->status = 0;
+		job->fd = -1;      /* no I/O pipe on Windows fast path */
+		job->event = NULL; /* no bufferevent — completion via self-pipe */
+		job->updatecb = updatecb;
+		job->completecb = completecb;
+		job->freecb = freecb;
+		job->data = data;
+
+		LIST_INSERT_HEAD(&all_jobs, job, entry);
+
+		log_debug("%s: Windows job %p started: %s, pid %ld",
+		    __func__, job, job->cmd, (long)job->pid);
+		return job;
+	}
+#endif /* PLATFORM_WINDOWS */
 	struct options	 *oo;
 
 	/*
@@ -382,6 +432,20 @@ job_check_died(pid_t pid, int status)
 	} else {
 		job->pid = -1;
 		job->state = JOB_DEAD;
+#ifdef PLATFORM_WINDOWS
+		/*
+		 * On Windows, jobs spawned via the Fast Path have no bufferevent
+		 * (fd == -1, event == NULL).  The POSIX path relies on the EOF
+		 * from the bufferevent triggering job_error_callback which then
+		 * calls completecb.  With no bufferevent that never fires, so we
+		 * call completecb directly here and free the job.
+		 */
+		if (job->fd == -1 && job->event == NULL) {
+			if (job->completecb != NULL)
+				job->completecb(job);
+			job_free(job);
+		}
+#endif
 	}
 }
 
