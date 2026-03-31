@@ -63,9 +63,28 @@ cmd_paste_buffer_exec(struct cmd *self, struct cmdq_item *item)
 	if (args_has(args, 'b'))
 		bufname = args_get(args, 'b');
 
-	if (bufname == NULL)
+	if (bufname == NULL) {
 		pb = paste_get_top(NULL);
-	else {
+#ifdef PLATFORM_WINDOWS
+		/*
+		 * On Windows, if the tmux paste buffer is empty, pull directly
+		 * from the Win32 clipboard so that paste-buffer / ']' works
+		 * like a normal clipboard paste without requiring the user to
+		 * first run refresh-client -l.
+		 */
+		if (pb == NULL) {
+			char	*cbdata;
+			size_t	 cblen;
+
+			cbdata = win32_clipboard_get(&cblen);
+			if (cbdata != NULL && cblen > 0) {
+				paste_add(NULL, cbdata, cblen);
+				pb = paste_get_top(NULL);
+			} else
+				free(cbdata);
+		}
+#endif
+	} else {
 		pb = paste_get_name(bufname);
 		if (pb == NULL) {
 			cmdq_error(item, "no buffer %s", bufname);

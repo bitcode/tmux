@@ -118,6 +118,17 @@ tty_init(struct tty *tty, struct client *c)
 	tty->ccolour = -1;
 	tty->fg = tty->bg = -1;
 
+#ifdef PLATFORM_WINDOWS
+	/*
+	 * PERM-01: c->fd may be a reconstructed TCP SOCKET from
+	 * WSADuplicateSocket — not a terminal.  Skip tcgetattr entirely;
+	 * tty_open will register it with libevent via event_set(c->fd, ...).
+	 * The tio struct stays zero-initialised (acceptable: raw-mode is
+	 * managed by the client via SetConsoleMode, not the server).
+	 */
+	if (c->fd != -1 && c->fd >= WINSOCK_FD_OFFSET)
+		return (0);
+#endif
 	if (c->fd != -1 && tcgetattr(c->fd, &tty->tio) != 0)
 		return (-1);
 	return (0);
@@ -287,12 +298,11 @@ tty_write_callback(__unused int fd, __unused short events, void *data)
 	else {
 		size_t len = EVBUFFER_LENGTH(tty->out);
 		if (len > 0) {
-			char *data = xmalloc(len);
-			evbuffer_remove(tty->out, data, len);
+			unsigned char *ptr = evbuffer_pullup(tty->out, len);
 			win32_log("tty_write_callback: calling win32_tty_write len=%zu\n", len);
-			win32_tty_write(c, data, len);
+			win32_tty_write(c, ptr, len);
 			win32_log("tty_write_callback: win32_tty_write returned\n");
-			free(data);
+			evbuffer_drain(tty->out, len);
 			nwrite = len;
 		}
 	}
@@ -320,10 +330,16 @@ tty_write_callback(__unused int fd, __unused short events, void *data)
 	}
 
 #ifdef PLATFORM_WINDOWS
-	/* Windows: also re-add event when c->fd == -1 for file_print_buffer path */
 	if (EVBUFFER_LENGTH(tty->out) != 0) {
-		win32_log("tty_write_callback: buffer not empty, activating event\n");
-		event_active(&tty->event_out, EV_WRITE, 1);
+		if (c->fd != -1)
+			/* PERM-01: real socket fd — use normal event_add. */
+			event_add(&tty->event_out, NULL);
+		else {
+			/* Legacy no-fd path: activate directly. */
+			win32_log("tty_write_callback: buffer not empty,"
+			    " activating event\n");
+			event_active(&tty->event_out, EV_WRITE, 1);
+		}
 	}
 	win32_log("tty_write_callback: EXIT success\n");
 #else
@@ -2439,6 +2455,18 @@ tty_set_selection(struct tty *tty, const char *flags, const char *buf,
 
 	if (~tty->flags & TTY_STARTED)
 		return;
+
+#ifdef PLATFORM_WINDOWS
+	/*
+	 * On Windows there is no outer terminal to receive OSC 52.
+	 * Write directly to the Win32 clipboard via OpenClipboard/SetClipboardData.
+	 * The flags parameter is ignored — we always target the system clipboard.
+	 */
+	(void)flags;
+	win32_clipboard_set(buf, len);
+	return;
+#endif
+
 	if (!tty_term_has(tty->term, TTYC_MS))
 		return;
 
@@ -3458,6 +3486,23 @@ tty_clipboard_query_callback(__unused int fd, __unused short events, void *data)
 void
 tty_clipboard_query(struct tty *tty)
 {
+#ifdef PLATFORM_WINDOWS
+	/*
+	 * On Windows there is no outer terminal to query via OSC 52.
+	 * Read directly from the Win32 clipboard and inject into the tmux
+	 * paste buffer so that paste-buffer / ']' works immediately.
+	 */
+	char	*cbdata;
+	size_t	 cblen;
+
+	(void)tty;
+	cbdata = win32_clipboard_get(&cblen);
+	if (cbdata != NULL && cblen > 0)
+		paste_add(NULL, cbdata, cblen);
+	else
+		free(cbdata);
+	return;
+#else
 	struct timeval	 tv = { .tv_sec = TTY_QUERY_TIMEOUT };
 
 	if ((tty->flags & TTY_STARTED) && (~tty->flags & TTY_OSC52QUERY)) {
@@ -3465,4 +3510,5 @@ tty_clipboard_query(struct tty *tty)
 		tty->flags |= TTY_OSC52QUERY;
 		evtimer_add(&tty->clipboard_timer, &tv);
 	}
+#endif
 }
