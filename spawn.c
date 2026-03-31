@@ -259,6 +259,17 @@ spawn_pane(struct spawn_context *sc, char **cause)
 			return (NULL);
 		}
 		if (sc->wp0->fd != -1) {
+#ifdef PLATFORM_WINDOWS
+			/*
+			 * Synchronously cancel RegisterWaitForSingleObject before
+			 * closing sv[0].  If we don't, pty_process_exited() may fire
+			 * asynchronously after the new spawn recycles the same fd
+			 * number and deregister the freshly-registered pty entry.
+			 * win32_pty_teardown_for_respawn() is a no-op when the pty
+			 * has already been cleaned up by pty_process_exited().
+			 */
+			win32_pty_teardown_for_respawn(sc->wp0->fd);
+#endif
 			bufferevent_free(sc->wp0->event);
 			close(sc->wp0->fd);
 		}
