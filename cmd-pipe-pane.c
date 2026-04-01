@@ -63,9 +63,12 @@ cmd_pipe_pane_exec(struct cmd *self, struct cmdq_item *item)
 	struct winlink			*wl = target->wl;
 	struct window_pane_offset	*wpo = &wp->pipe_offset;
 	char				*cmd;
-	int				 old_fd, pipe_fd[2], null_fd, in, out;
+	int				 old_fd, in, out;
 	struct format_tree		*ft;
+#ifndef PLATFORM_WINDOWS
+	int				 pipe_fd[2], null_fd;
 	sigset_t			 set, oldset;
+#endif
 
 	/* Do nothing if pane is dead. */
 	if (window_pane_exited(wp)) {
@@ -108,17 +111,74 @@ cmd_pipe_pane_exec(struct cmd *self, struct cmdq_item *item)
 		out = 1;
 	}
 
-	/* Open the new pipe. */
-	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, pipe_fd) != 0) {
-		cmdq_error(item, "socketpair error: %s", strerror(errno));
-		return (CMD_RETURN_ERROR);
-	}
-
 	/* Expand the command. */
 	ft = format_create(cmdq_get_client(item), item, FORMAT_NONE, 0);
 	format_defaults(ft, tc, s, wl, wp);
 	cmd = format_expand_time(ft, args_string(args, 0));
 	format_free(ft);
+
+#ifdef PLATFORM_WINDOWS
+	{
+		/*
+		 * Windows: replace fork()+socketpair()+execl() with
+		 * win32_pipe_pane_open().
+		 *
+		 * The -I flag (child stdout → pane input) is not supported on
+		 * Windows — ConPTY handles input injection separately and there
+		 * is no dup2(STDOUT) equivalent via anonymous pipes into a pane.
+		 * Reject -I with an error rather than silently doing nothing.
+		 */
+		int pipe_sock_fd = -1;
+
+		/*
+		 * -I: child stdout → socket EV_READ → read_callback →
+		 *     bufferevent_write(wp->event) → win32_bridge_in → ConPTY hPipeIn
+		 * -O: pane output → socket EV_WRITE → egress thread → child stdin
+		 * -IO: both directions simultaneously
+		 *
+		 * Use win32_pipe_pane_open_io() for -I and -IO cases.
+		 * Fall through to the original win32_pipe_pane_open() for plain -O.
+		 */
+		if (in) {
+			if (win32_pipe_pane_open_io(cmd, in, out, &pipe_sock_fd) != 0) {
+				cmdq_error(item, "pipe-pane: failed to open pipe");
+				free(cmd);
+				return (CMD_RETURN_ERROR);
+			}
+		} else {
+			if (win32_pipe_pane_open(cmd, &pipe_sock_fd) != 0) {
+				cmdq_error(item, "pipe-pane: failed to open pipe");
+				free(cmd);
+				return (CMD_RETURN_ERROR);
+			}
+		}
+
+		wp->pipe_fd = pipe_sock_fd;
+		memcpy(wpo, &wp->offset, sizeof *wpo);
+
+		setblocking(wp->pipe_fd, 0);
+		wp->pipe_event = bufferevent_new(wp->pipe_fd,
+		    cmd_pipe_pane_read_callback,
+		    cmd_pipe_pane_write_callback,
+		    cmd_pipe_pane_error_callback,
+		    wp);
+		if (wp->pipe_event == NULL)
+			fatalx("out of memory");
+		if (out)
+			bufferevent_enable(wp->pipe_event, EV_WRITE);
+		if (in)
+			bufferevent_enable(wp->pipe_event, EV_READ);
+
+		free(cmd);
+		return (CMD_RETURN_NORMAL);
+	}
+#else
+	/* Open the new pipe. */
+	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, pipe_fd) != 0) {
+		cmdq_error(item, "socketpair error: %s", strerror(errno));
+		free(cmd);
+		return (CMD_RETURN_ERROR);
+	}
 
 	/* Fork the child. */
 	sigfillset(&set);
@@ -183,6 +243,7 @@ cmd_pipe_pane_exec(struct cmd *self, struct cmdq_item *item)
 		free(cmd);
 		return (CMD_RETURN_NORMAL);
 	}
+#endif /* PLATFORM_WINDOWS */
 }
 
 static void
