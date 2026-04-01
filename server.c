@@ -451,6 +451,7 @@ server_child_main(struct tmuxproc *client, uint64_t flags, struct event_base *ba
 #ifdef PLATFORM_WINDOWS
     if (win32_job_init() != 0)
         win32_log("server_child_main: win32_job_init failed (if-shell will not work)\n");
+    win32_session_log_init();
     win32_log("server_child_main: entering proc_loop\n");
 #endif
 	proc_loop(server_proc, server_loop);
@@ -642,6 +643,13 @@ server_accept(int fd, short events, __unused void *data)
 		close(newfd);
 		return;
 	}
+#ifdef PLATFORM_WINDOWS
+	if (!win32_check_peer_is_owner(newfd)) {
+		win32_log("server_accept: peer SID mismatch, rejecting newfd=%d\n", newfd);
+		close(newfd);
+		return;
+	}
+#endif
 	win32_log("server_accept: calling server_client_create(%d)\n", newfd);
 	c = server_client_create(newfd);
 	win32_log("server_accept: server_client_create returned %p\n", c);

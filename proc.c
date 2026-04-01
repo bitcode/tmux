@@ -411,6 +411,12 @@ proc_flush_peer(struct tmuxpeer *peer)
 	imsgbuf_flush(&peer->ibuf);
 }
 
+int
+proc_get_peer_fd(struct tmuxpeer *peer)
+{
+	return peer->ibuf.fd;
+}
+
 void
 proc_toggle_log(struct tmuxproc *tp)
 {

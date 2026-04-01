@@ -40,6 +40,10 @@ static struct tmuxproc	*client_proc;
 static struct tmuxpeer	*client_peer;
 static uint64_t		 client_flags;
 static int		 client_suspended;
+#ifdef PLATFORM_WINDOWS
+/* Set to 1 when PERM-01 bridge threads (ingress+egress) are running. */
+static int		 client_perm01_active;
+#endif
 static enum {
 	CLIENT_EXIT_NONE,
 	CLIENT_EXIT_DETACHED,
@@ -122,38 +126,342 @@ client_resize_thread(void *arg)
 	return (0);
 }
 
+/*
+ * VK → VT sequence table for special keys that have no uChar representation.
+ * Plain printable characters are handled via uChar.AsciiChar / UnicodeChar.
+ * Modified keys (shift/ctrl/alt) use the ";mod" suffix in the sequences below.
+ *
+ * Modifier codes (1-based, added to base 1):
+ *   Shift=1, Alt=2, Ctrl=4  →  modifier_value = shift+alt*2+ctrl*4+1
+ *   e.g. Ctrl = 5, Shift+Ctrl = 6, Alt = 3, etc.
+ */
+struct vk_seq { WORD vk; const char *plain; const char *modified_fmt; };
+static const struct vk_seq vk_seq_table[] = {
+	{ VK_UP,     "\x1b[A",   "\x1b[1;%dA" },
+	{ VK_DOWN,   "\x1b[B",   "\x1b[1;%dB" },
+	{ VK_RIGHT,  "\x1b[C",   "\x1b[1;%dC" },
+	{ VK_LEFT,   "\x1b[D",   "\x1b[1;%dD" },
+	{ VK_HOME,   "\x1b[H",   "\x1b[1;%dH" },
+	{ VK_END,    "\x1b[F",   "\x1b[1;%dF" },
+	{ VK_INSERT, "\x1b[2~",  "\x1b[2;%d~" },
+	{ VK_DELETE, "\x1b[3~",  "\x1b[3;%d~" },
+	{ VK_PRIOR,  "\x1b[5~",  "\x1b[5;%d~" },  /* Page Up */
+	{ VK_NEXT,   "\x1b[6~",  "\x1b[6;%d~" },  /* Page Down */
+	{ VK_F1,     "\x1bOP",   "\x1b[1;%dP" },
+	{ VK_F2,     "\x1bOQ",   "\x1b[1;%dQ" },
+	{ VK_F3,     "\x1bOR",   "\x1b[1;%dR" },
+	{ VK_F4,     "\x1bOS",   "\x1b[1;%dS" },
+	{ VK_F5,     "\x1b[15~", "\x1b[15;%d~" },
+	{ VK_F6,     "\x1b[17~", "\x1b[17;%d~" },
+	{ VK_F7,     "\x1b[18~", "\x1b[18;%d~" },
+	{ VK_F8,     "\x1b[19~", "\x1b[19;%d~" },
+	{ VK_F9,     "\x1b[20~", "\x1b[20;%d~" },
+	{ VK_F10,    "\x1b[21~", "\x1b[21;%d~" },
+	{ VK_F11,    "\x1b[23~", "\x1b[23;%d~" },
+	{ VK_F12,    "\x1b[24~", "\x1b[24;%d~" },
+	{ VK_BACK,   "\x7f",     NULL },  /* Backspace */
+	{ VK_TAB,    "\t",       "\x1b[Z" },  /* Tab / Shift+Tab (backtab) */
+	{ VK_ESCAPE, "\x1b",     NULL },
+	{ VK_RETURN, "\r",       NULL },
+	{ 0, NULL, NULL }
+};
+
+/*
+ * Encode a KEY_EVENT_RECORD into VT bytes.
+ * Returns number of bytes written to |out| (max ~16).
+ */
+static int
+vk_to_vt(KEY_EVENT_RECORD *ke, char *out, int outsz)
+{
+	WORD vk  = ke->wVirtualKeyCode;
+	DWORD cs = ke->dwControlKeyState;
+	int shift = (cs & SHIFT_PRESSED) != 0;
+	int alt   = (cs & (LEFT_ALT_PRESSED  | RIGHT_ALT_PRESSED))  != 0;
+	int ctrl  = (cs & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
+	int mod   = shift + alt * 2 + ctrl * 4 + 1;  /* 1 = no modifier */
+
+	/* Check special-key table first */
+	for (int i = 0; vk_seq_table[i].vk != 0; i++) {
+		if (vk_seq_table[i].vk != vk)
+			continue;
+		/* Shift+Tab → backtab */
+		if (vk == VK_TAB && shift && vk_seq_table[i].modified_fmt != NULL) {
+			return snprintf(out, outsz, "%s",
+			    vk_seq_table[i].modified_fmt);
+		}
+		if (mod != 1 && vk_seq_table[i].modified_fmt != NULL) {
+			return snprintf(out, outsz,
+			    vk_seq_table[i].modified_fmt, mod);
+		}
+		if (vk_seq_table[i].plain != NULL) {
+			int len = (int)strlen(vk_seq_table[i].plain);
+			if (len < outsz) {
+				memcpy(out, vk_seq_table[i].plain, len);
+				return len;
+			}
+		}
+		return 0;
+	}
+
+	/* Regular characters: encode UnicodeChar as UTF-8 */
+	if (ke->uChar.UnicodeChar != 0) {
+		WCHAR wch = ke->uChar.UnicodeChar;
+		char  utf8[8];
+		int   utf8len;
+
+		utf8len = WideCharToMultiByte(CP_UTF8, 0, &wch, 1,
+		    utf8, sizeof utf8, NULL, NULL);
+		if (utf8len <= 0)
+			return 0;
+
+		/* Alt+key: prefix with ESC */
+		if (alt && outsz >= utf8len + 1) {
+			out[0] = '\x1b';
+			memcpy(out + 1, utf8, utf8len);
+			return utf8len + 1;
+		}
+		if (outsz >= utf8len) {
+			memcpy(out, utf8, utf8len);
+			return utf8len;
+		}
+		return 0;
+	}
+
+	return 0;
+}
+
+/*
+ * Encode a MOUSE_EVENT_RECORD into an SGR mouse sequence.
+ * Format: \x1b[<Pb;Px;PyM  (press) or ...m (release)
+ * Returns number of bytes written to |out|.
+ *
+ * Button encoding (Pb):
+ *   0 = left, 1 = middle, 2 = right
+ *   3 = release (X10 compat; SGR uses 'm' suffix instead)
+ *   32 = motion (no button change)
+ *   64 = wheel up, 65 = wheel down
+ * Modifiers are OR'd in: +4 shift, +8 alt, +16 ctrl
+ */
+static int
+mouse_to_sgr(MOUSE_EVENT_RECORD *me, char *out, int outsz)
+{
+	DWORD btn   = me->dwButtonState;
+	DWORD flags = me->dwEventFlags;
+	int   x     = me->dwMousePosition.X + 1;  /* 1-based */
+	int   y     = me->dwMousePosition.Y + 1;
+	DWORD cs    = me->dwControlKeyState;
+	int   mod   = 0;
+	int   pb;
+	char  suffix;
+
+	if (cs & SHIFT_PRESSED)                        mod |= 4;
+	if (cs & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED))  mod |= 8;
+	if (cs & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) mod |= 16;
+
+	if (flags & MOUSE_WHEELED) {
+		/* High word of dwButtonState: positive = up, negative = down */
+		int delta = (int)(short)HIWORD(btn);
+		pb = (delta > 0) ? 64 : 65;
+		suffix = 'M';
+	} else if (flags & MOUSE_MOVED) {
+		/* Motion: report whichever button is held, or 3 if none */
+		if (btn & FROM_LEFT_1ST_BUTTON_PRESSED)      pb = 0;
+		else if (btn & FROM_LEFT_2ND_BUTTON_PRESSED) pb = 1;
+		else if (btn & RIGHTMOST_BUTTON_PRESSED)     pb = 2;
+		else                                         pb = 3;
+		pb += 32;  /* motion flag */
+		suffix = 'M';
+	} else if (btn == 0) {
+		/*
+		 * All buttons released.  SGR uses button 0 + 'm' suffix for
+		 * release (the last pressed button is unknown, report 0).
+		 */
+		pb = 0;
+		suffix = 'm';
+	} else {
+		/* Button press */
+		if (btn & FROM_LEFT_1ST_BUTTON_PRESSED)      pb = 0;
+		else if (btn & FROM_LEFT_2ND_BUTTON_PRESSED) pb = 1;
+		else if (btn & RIGHTMOST_BUTTON_PRESSED)     pb = 2;
+		else                                         pb = 0;
+		suffix = 'M';
+	}
+
+	pb |= mod;
+	return snprintf(out, outsz, "\x1b[<%d;%d;%d%c", pb, x, y, suffix);
+}
+
 unsigned int __stdcall
 client_input_thread(void *arg)
 {
 	int	fd = (intptr_t)arg;
 	HANDLE	hIn = GetStdHandle(STD_INPUT_HANDLE);
-	char	buf[1024];
-	DWORD	nread;
+	INPUT_RECORD irec[32];
+	DWORD	nevents, i;
+	char	buf[512];  /* accumulate output before write */
+	int	buflen;
 
 	win32_log("client_input_thread: started with fd=%d, hIn=%p\n", fd, hIn);
 
 	while (1) {
-		if (!ReadFile(hIn, buf, sizeof buf, &nread, NULL)) {
-			DWORD err = GetLastError();
-			win32_log("client_input_thread: ReadFile failed, error=%lu\n", err);
+		if (!ReadConsoleInputW(hIn, irec,
+		    sizeof irec / sizeof irec[0], &nevents)) {
+			win32_log("client_input_thread: ReadConsoleInputW failed:"
+			    " %lu\n", GetLastError());
 			break;
 		}
-		if (nread == 0) {
-			win32_log("client_input_thread: ReadFile returned 0 bytes (EOF)\n");
-			break;
+
+		buflen = 0;
+		for (i = 0; i < nevents; i++) {
+			char tmp[32];
+			int  n = 0;
+
+			switch (irec[i].EventType) {
+			case KEY_EVENT:
+				if (!irec[i].Event.KeyEvent.bKeyDown)
+					break;
+				n = vk_to_vt(&irec[i].Event.KeyEvent,
+				    tmp, sizeof tmp);
+				break;
+			case MOUSE_EVENT:
+				n = mouse_to_sgr(&irec[i].Event.MouseEvent,
+				    tmp, sizeof tmp);
+				break;
+			default:
+				break;
+			}
+
+			if (n > 0) {
+				if (buflen + n > (int)sizeof buf) {
+					write(fd, buf, buflen);
+					buflen = 0;
+				}
+				memcpy(buf + buflen, tmp, n);
+				buflen += n;
+			}
 		}
-		win32_log("client_input_thread: read %lu bytes, writing to fd=%d\n", nread, fd);
-		ssize_t written = write(fd, buf, nread);
-		if (written == -1) {
-			win32_log("client_input_thread: write failed, errno=%d\n", errno);
-			break;
+
+		if (buflen > 0) {
+			win32_log("client_input_thread: writing %d bytes\n",
+			    buflen);
+			if (write(fd, buf, buflen) == -1) {
+				win32_log("client_input_thread: write failed:"
+				    " errno=%d\n", errno);
+				break;
+			}
 		}
-		win32_log("client_input_thread: wrote %zd bytes to fd=%d\n", written, fd);
 	}
-	win32_log("client_input_thread: thread exiting\n");
+
+	win32_log("client_input_thread: exiting\n");
 	return (0);
 }
 
+/*
+ * Egress bridge thread (PERM-01): recv bytes from the cross-process socket
+ * and write them to STD_OUTPUT_HANDLE.
+ *
+ * This is the server→client direction: VT escape sequences generated by tmux
+ * arrive on sock and are written to the terminal.
+ */
+unsigned int __stdcall
+client_tty_egress_thread(void *arg)
+{
+	SOCKET	sock = (SOCKET)(uintptr_t)arg;
+	HANDLE	hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+	char	buf[4096];
+	int	n;
+
+	win32_log("client_tty_egress_thread: started sock=%llu hOut=%p\n",
+	    (unsigned long long)sock, hOut);
+
+	while (1) {
+		n = recv(sock, buf, sizeof buf, 0);
+		if (n <= 0) {
+			win32_log("client_tty_egress_thread: recv returned %d, exiting\n", n);
+			break;
+		}
+		DWORD written;
+		if (!WriteFile(hOut, buf, (DWORD)n, &written, NULL)) {
+			win32_log("client_tty_egress_thread: WriteFile failed: %lu\n",
+			    GetLastError());
+			break;
+		}
+	}
+	win32_log("client_tty_egress_thread: exiting\n");
+	return (0);
+}
+
+/*
+ * Ingress bridge thread (PERM-01): read from STD_INPUT_HANDLE and send to
+ * the cross-process socket (client→server direction).
+ *
+ * Replaces the role of client_input_thread when WSAPROTOCOL_INFO fd-passing
+ * is in use. Stored on the same socket as the egress thread.
+ */
+unsigned int __stdcall
+client_tty_ingress_thread(void *arg)
+{
+	SOCKET		sock = (SOCKET)(uintptr_t)arg;
+	HANDLE		hIn = GetStdHandle(STD_INPUT_HANDLE);
+	INPUT_RECORD	irec[32];
+	DWORD		nevents, i;
+	char		buf[512];
+	int		buflen;
+
+	win32_log("client_tty_ingress_thread: started sock=%llu hIn=%p\n",
+	    (unsigned long long)sock, hIn);
+
+	while (1) {
+		if (!ReadConsoleInputW(hIn, irec,
+		    sizeof irec / sizeof irec[0], &nevents)) {
+			win32_log("client_tty_ingress_thread: ReadConsoleInputW"
+			    " failed: %lu\n", GetLastError());
+			break;
+		}
+
+		buflen = 0;
+		for (i = 0; i < nevents; i++) {
+			char tmp[32];
+			int  n = 0;
+
+			switch (irec[i].EventType) {
+			case KEY_EVENT:
+				if (!irec[i].Event.KeyEvent.bKeyDown)
+					break;
+				n = vk_to_vt(&irec[i].Event.KeyEvent,
+				    tmp, sizeof tmp);
+				break;
+			case MOUSE_EVENT:
+				n = mouse_to_sgr(&irec[i].Event.MouseEvent,
+				    tmp, sizeof tmp);
+				break;
+			default:
+				break;
+			}
+
+			if (n > 0) {
+				if (buflen + n > (int)sizeof buf) {
+					send(sock, buf, buflen, 0);
+					buflen = 0;
+				}
+				memcpy(buf + buflen, tmp, n);
+				buflen += n;
+			}
+		}
+
+		if (buflen > 0) {
+			win32_log("client_tty_ingress_thread: sending %d bytes\n",
+			    buflen);
+			if (send(sock, buf, buflen, 0) == SOCKET_ERROR) {
+				win32_log("client_tty_ingress_thread: send failed:"
+				    " %d\n", WSAGetLastError());
+				break;
+			}
+		}
+	}
+	win32_log("client_tty_ingress_thread: exiting\n");
+	return (0);
+}
 
 static void
 client_input_callback(__unused int fd_ignore, __unused short events, void *arg)
@@ -170,8 +478,49 @@ client_input_callback(__unused int fd_ignore, __unused short events, void *arg)
 	n = read(mapped_fd, buf, sizeof buf);
 	win32_log("client_input_callback: read returned %zd\n", n);
 	if (n > 0) {
+#ifdef PLATFORM_WINDOWS
+		/*
+		 * Intercept Ctrl+Z (0x1a = SIGTSTP approximation).
+		 * Send MSG_PANE_SUSPEND to the server instead of forwarding
+		 * the raw byte into ConPTY, which would not suspend anything.
+		 * Any bytes before/after \x1a in the buffer are forwarded normally.
+		 */
+		{
+			ssize_t i;
+			ssize_t seg_start = 0;
+			for (i = 0; i < n; i++) {
+				if ((unsigned char)buf[i] == 0x1a) {
+					/* Ctrl+Z — suspend active pane (SIGTSTP approximation) */
+					if (i > seg_start)
+						proc_send(client_peer, MSG_TTY_INPUT, -1,
+						    buf + seg_start, i - seg_start);
+					win32_log("client_input_callback: Ctrl+Z intercepted,"
+					    " sending MSG_PANE_SUSPEND\n");
+					proc_send(client_peer, MSG_PANE_SUSPEND, -1, NULL, 0);
+					seg_start = i + 1;
+				} else if ((unsigned char)buf[i] == 0x06) {
+					/*
+					 * Ctrl+F — resume suspended pane (fg/SIGCONT
+					 * approximation).  Press Ctrl+F at any point to
+					 * resume a pane suspended by Ctrl+Z.
+					 */
+					if (i > seg_start)
+						proc_send(client_peer, MSG_TTY_INPUT, -1,
+						    buf + seg_start, i - seg_start);
+					win32_log("client_input_callback: Ctrl+F intercepted,"
+					    " sending MSG_PANE_RESUME\n");
+					proc_send(client_peer, MSG_PANE_RESUME, -1, NULL, 0);
+					seg_start = i + 1;
+				}
+			}
+			if (seg_start < n)
+				proc_send(client_peer, MSG_TTY_INPUT, -1,
+				    buf + seg_start, n - seg_start);
+		}
+#else
 		win32_log("client_input_callback: sending MSG_TTY_INPUT with %zd bytes\n", n);
 		proc_send(client_peer, MSG_TTY_INPUT, -1, buf, n);
+#endif
 		proc_flush_peer(client_peer);
 	} else if (n == 0) {
 		win32_log("client_input_callback: EOF on input socket\n");
@@ -834,6 +1183,7 @@ client_send_identify(const char *ttynam, const char *termname, char **caps,
 		dwMode &= ~ENABLE_PROCESSED_INPUT;
 		dwMode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
 		dwMode |= ENABLE_WINDOW_INPUT;
+		dwMode |= ENABLE_MOUSE_INPUT;
 		if (!SetConsoleMode(hIn, dwMode)) {
 			win32_log("client_send_identify: SetConsoleMode(STDIN, raw) failed, error=%lu\n", GetLastError());
 		} else {
@@ -886,8 +1236,92 @@ client_send_identify(const char *ttynam, const char *termname, char **caps,
 	}
 
 
-	proc_send(client_peer, MSG_IDENTIFY_STDIN, -1, NULL, 0);
-	proc_send(client_peer, MSG_IDENTIFY_STDOUT, -1, &ws, sizeof ws);
+	/*
+	 * PERM-01: WSADuplicateSocket fd passing.
+	 *
+	 * SCM_RIGHTS is absent on Windows afunix.sys. Instead we:
+	 *   1. Create a TCP loopback socketpair sv[0]/sv[1].
+	 *   2. Start Ingress (stdin→sock) and Egress (sock→stdout) bridge threads
+	 *      on sv[1] (the local side that stays in the client).
+	 *   3. Call WSADuplicateSocket on sv[0] for the server process, producing
+	 *      a WSAPROTOCOL_INFO blob that is sent as the MSG_IDENTIFY_STDIN
+	 *      payload.  The server calls WSASocket(FROM_PROTOCOL_INFO) to
+	 *      reconstruct a live SOCKET for c->fd.
+	 *   4. MSG_IDENTIFY_STDOUT sends the winsize as usual (server uses
+	 *      the same c->fd for both directions via the full-duplex socket).
+	 *
+	 * Fallback: if WSADuplicateSocket fails (e.g. can't determine server
+	 * PID), we fall back to the original -1 / no-fd path so the session
+	 * still starts, just without a real tty fd on the server side.
+	 */
+	{
+		int       sv[2] = {-1, -1};
+		SOCKET    sock_server, sock_bridge;
+		DWORD     server_pid = 0;
+		DWORD     bytes_ret  = 0;
+		WSAPROTOCOL_INFOA proto_info;
+		int       dup_ok = 0;
+#define SIO_AF_UNIX_GETPEERPID  _WSAIOR(IOC_VENDOR, 256)
+
+		/* Get server PID from the AF_UNIX control socket */
+		SOCKET peer_sock = win32_from_map(proc_get_peer_fd(client_peer));
+		win32_log("client_send_identify: peer_fd=%d peer_sock=%llu\n",
+		    proc_get_peer_fd(client_peer), (unsigned long long)peer_sock);
+		if (peer_sock != INVALID_SOCKET) {
+			int ioctl_ret = WSAIoctl(peer_sock, SIO_AF_UNIX_GETPEERPID,
+			    NULL, 0, &server_pid, sizeof server_pid,
+			    &bytes_ret, NULL, NULL);
+			if (ioctl_ret != 0) {
+				win32_log("client_send_identify: SIO_AF_UNIX_GETPEERPID"
+				    " failed err=%d bytes_ret=%lu\n",
+				    WSAGetLastError(), bytes_ret);
+			}
+		}
+		win32_log("client_send_identify: server_pid=%lu\n", server_pid);
+
+		if (server_pid != 0 &&
+		    win32_socketpair(AF_INET, SOCK_STREAM, 0, sv) == 0) {
+			sock_server = win32_from_map(sv[0]);
+			sock_bridge = win32_from_map(sv[1]);
+
+			if (sock_server != INVALID_SOCKET &&
+			    sock_bridge != INVALID_SOCKET &&
+			    WSADuplicateSocketA(sock_server, server_pid,
+			        &proto_info) == 0) {
+				/* Start Ingress: stdin → sock_bridge */
+				_beginthreadex(NULL, 0, client_tty_ingress_thread,
+				    (void *)(uintptr_t)sock_bridge, 0, NULL);
+				/* Start Egress: sock_bridge → stdout */
+				_beginthreadex(NULL, 0, client_tty_egress_thread,
+				    (void *)(uintptr_t)sock_bridge, 0, NULL);
+				client_perm01_active = 1;
+			dup_ok = 1;
+				win32_log("client_send_identify: WSADuplicateSocket OK,"
+				    " sv[0]=%d sv[1]=%d\n", sv[0], sv[1]);
+			} else {
+				win32_log("client_send_identify: WSADuplicateSocket failed:"
+				    " %d — falling back to no-fd path\n",
+				    WSAGetLastError());
+			}
+		}
+
+		if (dup_ok) {
+			/*
+			 * Send WSAPROTOCOL_INFO as payload — server will call
+			 * WSASocket(FROM_PROTOCOL_INFO) to get a live SOCKET.
+			 * sv[0] (sock_server) is now owned by the server after
+			 * reconstruction; close our reference.
+			 */
+			proc_send(client_peer, MSG_IDENTIFY_STDIN, -1,
+			    &proto_info, sizeof proto_info);
+			/* sv[0] server side is reconstructed by server; close client copy */
+			closesocket(sock_server);
+			win32_remove_from_map(sv[0]);
+		} else {
+			proc_send(client_peer, MSG_IDENTIFY_STDIN, -1, NULL, 0);
+		}
+		proc_send(client_peer, MSG_IDENTIFY_STDOUT, -1, &ws, sizeof ws);
+	}
 #else
 	if ((fd = dup(STDIN_FILENO)) == -1)
 		fatal("dup failed");
@@ -1097,7 +1531,13 @@ client_dispatch_wait(struct imsg *imsg)
 #ifdef PLATFORM_WINDOWS
 		{
 			int input_fds[2];
-			if (win32_socketpair(AF_INET, SOCK_STREAM, 0, input_fds) == 0) {
+			/*
+			 * PERM-01: if bridge threads are already running (WSADuplicateSocket
+			 * fd-passing succeeded), do NOT start a second client_input_thread —
+			 * two concurrent ReadConsoleInputW callers corrupt input.
+			 */
+			if (!client_perm01_active &&
+			    win32_socketpair(AF_INET, SOCK_STREAM, 0, input_fds) == 0) {
 				win32_log("client_dispatch_attached: input_fds[0]=%d, input_fds[1]=%d\n", input_fds[0], input_fds[1]);
 				_beginthreadex(NULL, 0, client_input_thread, (void*)(intptr_t)input_fds[1], 0, NULL);
 				struct event *ev = xmalloc(sizeof *ev);

@@ -111,6 +111,8 @@ extern const struct cmd_entry cmd_source_file_entry;
 extern const struct cmd_entry cmd_split_window_entry;
 extern const struct cmd_entry cmd_start_server_entry;
 extern const struct cmd_entry cmd_suspend_client_entry;
+extern const struct cmd_entry cmd_suspend_pane_entry;
+extern const struct cmd_entry cmd_resume_pane_entry;
 extern const struct cmd_entry cmd_swap_pane_entry;
 extern const struct cmd_entry cmd_swap_window_entry;
 extern const struct cmd_entry cmd_switch_client_entry;
@@ -203,6 +205,8 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_split_window_entry,
 	&cmd_start_server_entry,
 	&cmd_suspend_client_entry,
+	&cmd_suspend_pane_entry,
+	&cmd_resume_pane_entry,
 	&cmd_swap_pane_entry,
 	&cmd_swap_window_entry,
 	&cmd_switch_client_entry,

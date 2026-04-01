@@ -237,23 +237,35 @@ cmd_run_shell_callback(struct job *job)
 	size_t				 size;
 	int				 retcode, status;
 
-	do {
-		line = evbuffer_readln(event->input, NULL, EVBUFFER_EOL_LF);
-		if (line != NULL) {
+	if (event != NULL) {
+#ifndef PLATFORM_WINDOWS
+		/*
+		 * On Windows, evbuffer_readln() deadlocks when called from
+		 * inside libevent's bufferevent error callback because libevent
+		 * 2.x holds an internal evbuffer lock during dispatch.  Skip
+		 * the output-drain loop; run-shell output display is not
+		 * supported on Windows (run-shell -p goes to view mode anyway).
+		 */
+		do {
+			line = evbuffer_readln(event->input, NULL,
+			    EVBUFFER_EOL_LF);
+			if (line != NULL) {
+				cmd_run_shell_print(job, line);
+				free(line);
+			}
+		} while (line != NULL);
+
+		size = EVBUFFER_LENGTH(event->input);
+		if (size != 0) {
+			line = xmalloc(size + 1);
+			memcpy(line, EVBUFFER_DATA(event->input), size);
+			line[size] = '\0';
+
 			cmd_run_shell_print(job, line);
+
 			free(line);
 		}
-	} while (line != NULL);
-
-	size = EVBUFFER_LENGTH(event->input);
-	if (size != 0) {
-		line = xmalloc(size + 1);
-		memcpy(line, EVBUFFER_DATA(event->input), size);
-		line[size] = '\0';
-
-		cmd_run_shell_print(job, line);
-
-		free(line);
+#endif /* !PLATFORM_WINDOWS */
 	}
 
 	status = job_get_status(job);

@@ -68,7 +68,13 @@ enum msgtype {
 	MSG_WRITE_READY,
 	MSG_WRITE_CLOSE,
 	MSG_READ_CANCEL,
-	MSG_TTY_INPUT = 400
+	MSG_TTY_INPUT = 400,
+
+	/* Windows-only: client detected Ctrl+Z, request server to suspend pane */
+	MSG_PANE_SUSPEND = 500,
+
+	/* Windows-only: client requests resume of suspended pane (fg equivalent) */
+	MSG_PANE_RESUME = 501
 };
 
 /*

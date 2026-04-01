@@ -85,14 +85,22 @@ job_run(const char *cmd, int argc, char **argv, struct environ *e,
 
 #ifdef PLATFORM_WINDOWS
 	/*
-	 * Windows Fast Path: fork()/socketpair()/execl() do not exist on Win32.
-	 * Use CreateProcess + RegisterWaitForSingleObject + self-pipe instead.
-	 * Only the exit code is captured (sufficient for if-shell, run-shell).
-	 * stdout/stderr capture (pipe-pane, update callbacks) is not yet wired.
+	 * Windows execution paths — fork()/socketpair()/execl() unavailable.
+	 *
+	 * Fast Path (exit code only): used when no output is needed (if-shell).
+	 *   win32_job_run() → job->fd = -1, job->event = NULL.
+	 *   job_check_died() calls completecb directly on the main thread.
+	 *
+	 * Full I/O Bridge Path: used when completecb or updatecb is set and
+	 *   output must be readable via job->event (run-shell -p, pipe-pane).
+	 *   win32_job_run_io() → job->fd = loopback socket, job->event set.
+	 *   EOF on the socket triggers job_error_callback → completecb, same
+	 *   as the POSIX socketpair path.
 	 */
 	{
 		const char *win_shell = NULL;
 		struct options *win_oo;
+		int win_out_fd = -1;
 
 		if (flags & JOB_DEFAULTSHELL) {
 			win_oo = (s != NULL) ? s->options : global_s_options;
@@ -102,33 +110,73 @@ job_run(const char *cmd, int argc, char **argv, struct environ *e,
 		}
 
 		if (cmd == NULL) {
-			log_debug("%s: Windows: argc-based commands not supported", __func__);
+			log_debug("%s: Windows: argc-based commands not supported",
+			    __func__);
 			return NULL;
 		}
 
-		pid = win32_job_run(cmd, win_shell);
-		if (pid == -1) {
-			log_debug("%s: win32_job_run failed for: %s", __func__, cmd);
-			return NULL;
+		if (flags & JOB_PTY) {
+			/* PTY Path — used by display-popup (interactive shell in ConPTY) */
+			pid = win32_job_run_pty(cmd, win_shell, sx, sy,
+			    &win_out_fd);
+			if (pid == -1) {
+				log_debug("%s: win32_job_run_pty failed for: %s",
+				    __func__, cmd);
+				return NULL;
+			}
+		} else if (completecb != NULL || updatecb != NULL) {
+			/* Full I/O Bridge Path */
+			pid = win32_job_run_io(cmd, win_shell, &win_out_fd);
+			if (pid == -1) {
+				log_debug("%s: win32_job_run_io failed for: %s",
+				    __func__, cmd);
+				return NULL;
+			}
+		} else {
+			/* Fast Path */
+			pid = win32_job_run(cmd, win_shell);
+			if (pid == -1) {
+				log_debug("%s: win32_job_run failed for: %s",
+				    __func__, cmd);
+				return NULL;
+			}
 		}
 
 		job = xcalloc(1, sizeof *job);
-		job->state = JOB_RUNNING;
-		job->flags = flags;
-		job->cmd = xstrdup(cmd);
-		job->pid = pid;
-		job->status = 0;
-		job->fd = -1;      /* no I/O pipe on Windows fast path */
-		job->event = NULL; /* no bufferevent — completion via self-pipe */
-		job->updatecb = updatecb;
+		job->state      = JOB_RUNNING;
+		job->flags      = flags;
+		job->cmd        = xstrdup(cmd);
+		job->pid        = pid;
+		job->status     = 0;
+		job->updatecb   = updatecb;
 		job->completecb = completecb;
-		job->freecb = freecb;
-		job->data = data;
+		job->freecb     = freecb;
+		job->data       = data;
+
+		if (win_out_fd != -1) {
+			/* I/O bridge: wire up bufferevent on loopback socket */
+			job->fd = win_out_fd;
+			setblocking(job->fd, 0);
+			/*
+			 * bufferevent_new is #defined to win32_bufferevent_new
+			 * which translates fake fds to real SOCKET handles for
+			 * libevent's select() backend.
+			 */
+			job->event = bufferevent_new(job->fd, job_read_callback,
+			    job_write_callback, job_error_callback, job);
+			if (job->event == NULL)
+				fatalx("out of memory");
+			bufferevent_enable(job->event, EV_READ | EV_WRITE);
+		} else {
+			job->fd    = -1;
+			job->event = NULL;
+		}
 
 		LIST_INSERT_HEAD(&all_jobs, job, entry);
 
-		log_debug("%s: Windows job %p started: %s, pid %ld",
-		    __func__, job, job->cmd, (long)job->pid);
+		log_debug("%s: Windows job %p started: %s, pid %ld (io=%s)",
+		    __func__, job, job->cmd, (long)job->pid,
+		    win_out_fd != -1 ? "yes" : "no");
 		return job;
 	}
 #endif /* PLATFORM_WINDOWS */
