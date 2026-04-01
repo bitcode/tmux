@@ -3568,6 +3568,58 @@ server_client_dispatch(struct imsg *imsg, void *arg)
 			tty_keys_next(&c->tty);
 		}
 		break;
+#ifdef PLATFORM_WINDOWS
+	case MSG_PANE_SUSPEND:
+		/*
+		 * Client detected Ctrl+Z. Suspend the active pane's process
+		 * tree via Job Object + NtSuspendProcess (PERM-02), then
+		 * deliver CTRL_BREAK_EVENT via the signal proxy so the child
+		 * shell sees a SIGTSTP-equivalent before being frozen.
+		 */
+		if (c->session != NULL) {
+			struct window      *w  = c->session->curw->window;
+			struct window_pane *wp = w->active;
+			if (wp != NULL && wp->fd != -1) {
+				win32_pty_t *pty = win32_pty_lookup(wp->fd);
+				HANDLE hJob      = win32_pty_get_job(pty);
+				DWORD  cpid      = win32_pty_get_child_pid(wp->fd);
+				win32_log("server_client_dispatch: MSG_PANE_SUSPEND"
+				    " pane=%u fd=%d hJob=%p pid=%lu\n",
+				    wp->id, wp->fd, hJob, cpid);
+				if (win32_jobctl_suspend(hJob, cpid))
+					status_message_set(c, 2000, 1, 0, 0,
+					    "Pane suspended (Ctrl+F to resume)");
+				else
+					status_message_set(c, 2000, 1, 0, 0,
+					    "Suspend failed");
+			}
+		}
+		break;
+	case MSG_PANE_RESUME:
+		/*
+		 * Client requested fg/resume (Ctrl+F). Resume all processes
+		 * in the active pane's Job Object and synthesize a SIGWINCH
+		 * to redraw the shell prompt (PERM-02).
+		 */
+		if (c->session != NULL) {
+			struct window      *w  = c->session->curw->window;
+			struct window_pane *wp = w->active;
+			if (wp != NULL && wp->fd != -1) {
+				win32_pty_t *pty = win32_pty_lookup(wp->fd);
+				HANDLE hJob      = win32_pty_get_job(pty);
+				DWORD  cpid      = win32_pty_get_child_pid(wp->fd);
+				HPCON  hPC       = win32_pty_get_console(pty);
+				COORD  size      = win32_pty_get_coord(pty);
+				win32_log("server_client_dispatch: MSG_PANE_RESUME"
+				    " pane=%u fd=%d hJob=%p pid=%lu\n",
+				    wp->id, wp->fd, hJob, cpid);
+				if (win32_jobctl_resume(hJob, cpid, hPC, size))
+					status_message_set(c, 1500, 1, 0, 0,
+					    "Pane resumed");
+			}
+		}
+		break;
+#endif
 	}
 
 	return;
@@ -3788,9 +3840,45 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 		log_debug("client %p IDENTIFY_CWD %s", c, data);
 		break;
 	case MSG_IDENTIFY_STDIN:
+#ifdef PLATFORM_WINDOWS
+		/*
+		 * PERM-01: WSADuplicateSocket fd passing.
+		 * Client sends WSAPROTOCOL_INFOA as payload instead of an fd
+		 * (SCM_RIGHTS is absent on Windows afunix.sys).
+		 * Reconstruct a live SOCKET and map it to a fake fd for c->fd.
+		 */
+		if (datalen == sizeof(WSAPROTOCOL_INFOA)) {
+			WSAPROTOCOL_INFOA proto_info;
+			SOCKET new_sock;
+			int    new_fd;
+			memcpy(&proto_info, data, sizeof proto_info);
+			new_sock = WSASocketA(FROM_PROTOCOL_INFO,
+			    FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO,
+			    &proto_info, 0, 0);
+			if (new_sock == INVALID_SOCKET) {
+				win32_log("client %p IDENTIFY_STDIN WSASocket failed: %d\n",
+				    c, WSAGetLastError());
+				return (-1);
+			}
+			new_fd = win32_add_to_map(new_sock);
+			if (new_fd == -1) {
+				closesocket(new_sock);
+				return (-1);
+			}
+			c->fd = new_fd;
+			win32_log("client %p IDENTIFY_STDIN WSASocket OK sock=%llu fd=%d\n",
+			    c, (unsigned long long)new_sock, c->fd);
+			log_debug("client %p IDENTIFY_STDIN (WSADup) fd=%d", c, c->fd);
+			break;
+		}
 		if (datalen != 0)
 			return (-1);
 		c->fd = imsg_get_fd(imsg);
+#else
+		if (datalen != 0)
+			return (-1);
+		c->fd = imsg_get_fd(imsg);
+#endif
 		log_debug("client %p IDENTIFY_STDIN %d", c, c->fd);
 		break;
 	case MSG_IDENTIFY_STDOUT:
@@ -3862,7 +3950,11 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 	if (c->flags & CLIENT_CONTROL)
 		control_start(c);
 #ifdef PLATFORM_WINDOWS
-	else if (c->ttyname != NULL && *c->ttyname != '\0') {
+	/*
+	 * PERM-01: prefer a real socket fd from WSADuplicateSocket.
+	 * Fall back to ttyname-based open if fd passing did not work.
+	 */
+	else if (c->fd != -1 || (c->ttyname != NULL && *c->ttyname != '\0')) {
 #else
 	else if (c->fd != -1) {
 #endif
